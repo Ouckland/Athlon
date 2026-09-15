@@ -1,0 +1,127 @@
+# Athlon
+
+Athlon is a football platform built around **live match experiences and fantasy football**.
+
+The goal is to make following local football more engaging by combining real-time match updates, player performances, fantasy football, and leaderboards in one platform.
+
+## Core Experience
+
+MATCH
+  ↓
+MATCH EVENTS
+  ↓
+LIVE SCORE
+  ↓
+PLAYER PERFORMANCE
+  ↓
+FANTASY POINTS
+  ↓
+LEADERBOARDS
+
+Users can follow live matches, build fantasy squads, compete with friends, and track their performance.
+
+## MVP
+
+The first version focuses on:
+
+* User authentication
+* Organizations and competitions
+* Teams and players
+* Fixtures and matches
+* Live match events and scores
+* Fantasy football
+* Fantasy squads
+* Global leaderboard
+* Private fantasy groups
+* Real-time match updates
+
+## Project Structure
+
+athlon/
+├── backend/       # Django API and business logic
+├── frontend/      # React PWA
+├── docs/          # Architecture and project documentation
+├── .gitignore
+└── README.md
+
+## Backend
+
+The backend is built with:
+
+* Python
+* Django
+* Django REST Framework
+* PostgreSQL
+* Django Channels / WebSockets
+
+Backend applications:
+
+accounts/   # Users, authentication and permissions
+league/     # Organizations, competitions, teams and players
+matches/    # Matches, events and live match logic
+fantasy/    # Fantasy squads, scoring and leaderboards
+
+## Frontend
+
+The frontend is a React-based Progressive Web App.
+
+The frontend communicates with the Django backend through the API and receives live match updates through WebSockets.
+
+## Development
+
+### Backend
+
+bash
+cd backend
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate on Windows
+.venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run migrations
+python manage.py migrate
+
+# Start development server
+python manage.py runserver
+
+### Frontend
+
+bash
+cd frontend
+
+npm install
+npm run dev
+
+## Development Workflow
+
+Athlon uses feature branches rather than direct development on `main`.
+
+main
+│
+├── feat/backend-...
+├── feat/frontend-...
+└── ...
+
+Changes should be committed to a feature branch and merged into `main` through a pull request.
+
+## Documentation
+
+More detailed project decisions are kept in `/docs`.
+
+These include:
+
+* Architecture
+* API contracts
+* Match and realtime logic
+* Fantasy scoring
+* Development plan
+* Collaboration guidelines
+
+## Status
+
+Athlon is currently in active MVP development.

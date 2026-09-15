@@ -1,0 +1,141 @@
+from django.utils.text import slugify
+
+from league.models import Competition, Organization, Player, Team
+
+
+class LeagueError(Exception):
+    """Raised when a league domain rule is violated."""
+
+
+def _unique_slug(model, base_slug, organization=None, max_length=200):
+    """Return a slug that is unique within (organization, model) scope."""
+    base_slug = (base_slug or "item")[:max_length]
+    candidate = base_slug
+    qs = model.objects.all()
+    if organization is not None:
+        qs = qs.filter(organization=organization)
+    i = 2
+    while qs.filter(slug=candidate).exists():
+        suffix = f"-{i}"
+        candidate = f"{base_slug[: max_length - len(suffix)]}{suffix}"
+        i += 1
+    return candidate
+
+
+def create_organization(*, name, description="", logo=None, slug=None):
+    if not name or not name.strip():
+        raise LeagueError("Organization name is required.")
+    return Organization.objects.create(
+        name=name.strip(),
+        slug=_unique_slug(Organization, slug or slugify(name), max_length=220),
+        description=description or "",
+        logo=logo,
+    )
+
+
+def create_competition(
+    *,
+    organization,
+    name,
+    description="",
+    season="",
+    status=Competition.Status.DRAFT,
+    start_date=None,
+    end_date=None,
+    slug=None,
+):
+    if not name or not name.strip():
+        raise LeagueError("Competition name is required.")
+    if status not in Competition.Status.values:
+        raise LeagueError("Invalid competition status.")
+    return Competition.objects.create(
+        organization=organization,
+        name=name.strip(),
+        slug=_unique_slug(
+            Competition,
+            slug or slugify(name),
+            organization=organization,
+            max_length=220,
+        ),
+        description=description or "",
+        season=season or "",
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def create_team(*, organization, name, short_name="", logo=None, slug=None):
+    if not name or not name.strip():
+        raise LeagueError("Team name is required.")
+    return Team.objects.create(
+        organization=organization,
+        name=name.strip(),
+        slug=_unique_slug(
+            Team,
+            slug or slugify(name),
+            organization=organization,
+            max_length=220,
+        ),
+        short_name=short_name or "",
+        logo=logo,
+    )
+
+
+def add_player_to_team(
+    *,
+    team,
+    first_name,
+    last_name="",
+    display_name="",
+    shirt_number=None,
+    position,
+    photo=None,
+    user=None,
+):
+    if not first_name or not first_name.strip():
+        raise LeagueError("Player first name is required.")
+    if position not in Player.Position.values:
+        raise LeagueError("Invalid player position.")
+    return Player.objects.create(
+        team=team,
+        user=user,
+        first_name=first_name.strip(),
+        last_name=(last_name or "").strip(),
+        display_name=(display_name or "").strip(),
+        shirt_number=shirt_number,
+        position=position,
+        photo=photo,
+    )
+
+
+def set_team_captain(*, team, player):
+    """Set or clear the captain. Captain must belong to `team`."""
+    if player is None:
+        team.captain = None
+        team.save(update_fields=["captain", "updated_at"])
+        return team
+    if player.team_id != team.id:
+        raise LeagueError("Captain must belong to the team.")
+    team.captain = player
+    team.save(update_fields=["captain", "updated_at"])
+    return team
+
+def set_team_competitions(*, team, competitions):
+    """
+    Assign competitions to a team.
+
+    Every competition must belong to the same organization as the team.
+    Raises LeagueError on mismatch.
+    """
+    comps = list(competitions)
+    mismatched = [
+        c.name for c in comps if c.organization_id != team.organization_id
+    ]
+    if mismatched:
+        raise LeagueError(
+            "Competitions must belong to the same organization as the team. "
+            f"Mismatched: {', '.join(mismatched)}."
+        )
+    team.competitions.set(comps)
+    return team
