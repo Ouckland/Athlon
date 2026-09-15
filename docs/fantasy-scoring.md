@@ -11,32 +11,25 @@ Fantasy Engine
 Player Points
     ↓
 Fantasy Team Points
-```
 
 Users never manually enter points.
 
----
 
 # MVP Formation
 
 Each fantasy team selects:
 
-```text
-1 Goalkeeper
-3 Defenders
-3 Midfielders
+2 Goalkeeper
+5 Defenders
+5 Midfielders
 3 Forwards
-```
 
 Total:
 
-```text
-10 players
-```
+15 players
 
 The remaining squad/bench system is optional and should not block MVP.
 
----
 
 # Captain
 
@@ -44,9 +37,7 @@ The user selects one captain.
 
 Captain receives:
 
-```text
 2 × normal points
-```
 
 ---
 
@@ -75,31 +66,22 @@ Do not hardcode scoring logic throughout the application.
 
 Player:
 
-```text
 Adekunle
 MID
-```
 
 Match:
 
-```text
 Goal
 Assist
-```
 
 Points:
 
-```text
 5 + 3 = 8
-```
 
 If Adekunle is captain:
 
-```text
 8 × 2 = 16
-```
 
----
 
 # Important
 

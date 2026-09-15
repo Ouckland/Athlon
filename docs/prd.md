@@ -63,12 +63,9 @@ A school owns competitions.
 
 Example:
 
-```text
 FUNAAB
 └── 2026/27 Football League
-```
 
----
 
 ## Teams
 
@@ -80,7 +77,6 @@ A team has:
 * Logo
 * Players
 
----
 
 ## Players
 
@@ -92,7 +88,6 @@ A player has:
 * Shirt number
 * Team
 
----
 
 ## Matches
 
@@ -172,17 +167,14 @@ Fantasy points come from real match events.
 
 Users do **not** manually enter fantasy points.
 
----
 
 # 5. League Table
 
 Standings are calculated from completed matches.
 
-```text
 Win  = 3 points
 Draw = 1 point
 Loss = 0 points
-```
 
 Include:
 
@@ -195,7 +187,6 @@ Include:
 * Goal Difference
 * Points
 
----
 
 # 6. Real-Time Updates
 
@@ -203,7 +194,6 @@ Live updates use WebSockets.
 
 Flow:
 
-```text
 Scout
   ↓
 Django API
@@ -215,13 +205,11 @@ Business Logic
 WebSocket
   ↓
 React
-```
 
 The frontend should not calculate the official score or fantasy points.
 
 The backend is the source of truth.
 
----
 
 # 7. Out of Scope
 

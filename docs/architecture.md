@@ -22,13 +22,11 @@
 
 Suggested Django apps:
 
-apps/
-├── accounts/
-├── schools/
-├── teams/
-├── competitions/
-├── matches/
-└── fantasy/
+├── apps/
+│   ├── accounts/
+│   ├── league/
+│   ├── matches/
+│   └── fantasy/
 
 Keep apps focused.
 
@@ -37,7 +35,7 @@ Do not create an app for every tiny feature.
 
 # Main Relationships
 
-School
+League
   ↓
 Competition
   ↓
@@ -152,9 +150,6 @@ Broadcast update
 match_42 group
    ↓
 Connected React clients
-```
-
----
 
 # Event Safety
 

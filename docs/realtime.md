@@ -83,7 +83,6 @@ Confirm
 Backend processes event
        ↓
 Live update
-```
 
 The scout interface should be fast.
 

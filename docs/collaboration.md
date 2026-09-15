@@ -46,7 +46,6 @@ Both developers work on:
 * Testing
 * Code review
 
----
 
 # Git Workflow
 
@@ -54,26 +53,21 @@ Never push directly to `main`.
 
 Create a feature branch:
 
-```text
 feat/backend-matches
 feat/backend-fantasy
 feat/frontend-live-match
 feat/frontend-fantasy
-```
 
 Then:
 
-```text
-git add .
+git add *file
 git commit
 git push
-```
 
 Open a Pull Request.
 
 Review before merging.
 
----
 
 # Commits
 
@@ -81,23 +75,18 @@ Keep commits small and clear.
 
 Good:
 
-```text
 feat: add match event model
 feat: add live match endpoint
 fix: prevent duplicate match events
 feat: add fantasy scoring service
-```
 
 Avoid:
 
-```text
 update stuff
 changes
 final
 fixed everything
-```
 
----
 
 # Working Together
 
@@ -109,7 +98,6 @@ Before starting a feature:
 4. Build separately.
 5. Test together.
 
----
 
 # Important Rule
 
@@ -117,7 +105,6 @@ Do not make large architectural changes without discussing them first.
 
 If something feels wrong:
 
-```text
 Stop
  ↓
 Discuss
@@ -127,9 +114,7 @@ Decide
 Document
  ↓
 Build
-```
 
----
 
 # AI Usage
 
@@ -145,13 +130,11 @@ Before accepting generated code:
 
 Do not let AI independently redesign the project.
 
----
 
 # Communication
 
 Use a simple task format:
 
-```text
 TASK:
 Add live match event creation.
 
@@ -163,4 +146,3 @@ Match API
 
 DONE WHEN:
 Scout can create a goal and connected clients receive it.
-```

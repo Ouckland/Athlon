@@ -90,13 +90,11 @@ The goal is a working MVP, not a complete product.
 * Player selection
 * Fantasy dashboard
 
----
 
 # Day 5 — Integration
 
 Test:
 
-```text
 Goal
  ↓
 Score
@@ -108,17 +106,14 @@ React
 Fantasy points
  ↓
 Leaderboard
-```
 
 Fix integration issues.
 
----
 
 # Day 6 — Real Match Simulation
 
 Run a complete match:
 
-```text
 START
  ↓
 GOAL
@@ -134,7 +129,6 @@ HALFTIME
 GOAL
  ↓
 FULLTIME
-```
 
 Test multiple connected users.
 
@@ -142,7 +136,6 @@ Test duplicate events.
 
 Test reconnecting WebSockets.
 
----
 
 # Day 7 — Ship
 
@@ -158,14 +151,12 @@ Focus only on:
 
 No new major features.
 
----
 
 # Definition of Done
 
 Athlon is ready when:
 
-```text
-Admin creates competition
+Admin creates league / competition
         ↓
 Teams and players exist
         ↓
@@ -186,6 +177,5 @@ Leaderboard updates
 Match finishes
         ↓
 Standings update
-```
 
 If this works reliably, the MVP is done.

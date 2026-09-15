@@ -4,7 +4,6 @@ The API is the contract between Django and React.
 
 Frontend should not depend on Django implementation details.
 
----
 
 # API Rules
 
@@ -12,11 +11,9 @@ Use JSON.
 
 Example:
 
-```text
 GET /api/matches/
 GET /api/matches/{id}/
 POST /api/matches/{id}/events/
-```
 
 Authentication should use the agreed auth mechanism for the project.
 
@@ -26,7 +23,6 @@ Authentication should use the agreed auth mechanism for the project.
 
 Example:
 
-```json
 {
   "id": 42,
   "home_team": {
@@ -42,15 +38,12 @@ Example:
   "status": "LIVE",
   "minute": 67
 }
-```
 
----
 
 # Match Event
 
 Example request:
 
-```json
 {
   "event_id": "uuid",
   "type": "goal",
@@ -58,11 +51,9 @@ Example request:
   "player_id": 17,
   "minute": 67
 }
-```
 
 Response:
 
-```json
 {
   "id": "uuid",
   "type": "goal",
@@ -74,9 +65,7 @@ Response:
     "away": 1
   }
 }
-```
 
----
 
 # Frontend Rule
 
@@ -86,25 +75,19 @@ Do not duplicate business rules in React.
 
 Bad:
 
-```text
 React calculates fantasy points
-```
 
 Good:
 
-```text
 Django calculates
         ↓
 React displays
-```
 
----
 
 # WebSocket Contract
 
 Example:
 
-```json
 {
   "type": "match.event",
   "event": "goal",
@@ -115,7 +98,6 @@ Example:
   "home_score": 2,
   "away_score": 1
 }
-```
 
 The WebSocket payload should contain enough information for the UI to update without immediately making another request.
 
