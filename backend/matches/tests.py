@@ -1,10 +1,13 @@
 from django.db import IntegrityError, transaction
+from django.contrib.auth import get_user_model
+from django.urls import reverse
 from django.test import TestCase
 from django.utils import timezone
 
 from league.models import Competition, Organization, Player, Team
 from matches.models import Match, MatchEvent
 from matches.services import MatchError, create_match, record_match_event
+from rest_framework.test import APIClient
 
 
 # ---------------------------------------------------------------------------
@@ -472,3 +475,289 @@ class RecordMatchEventLifecycleTests(_Base):
         )
         self.match.refresh_from_db()
         self.assertEqual(self.match.away_score, 1)
+
+User = get_user_model()
+
+
+class MatchAPITests(_Base):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="matches-api@example.com", password="StrongPass!23"
+        )
+        self.list_url = reverse("matches:match-list")
+
+    # ------------------------------------------------------------------
+    # Listing
+    # ------------------------------------------------------------------
+    def test_list_matches_is_public(self):
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["id"], self.match.id)
+
+    def test_list_response_structure(self):
+        resp = self.client.get(self.list_url)
+        row = resp.data[0]
+        for key in (
+            "id", "competition", "home_team", "away_team",
+            "status", "home_score", "away_score", "minute",
+        ):
+            self.assertIn(key, row)
+        self.assertEqual(set(row["home_team"].keys()), {"id", "name", "short_name"})
+        self.assertEqual(set(row["competition"].keys()), {"id", "name", "slug"})
+
+    def test_filter_by_competition(self):
+        other_org = Organization.objects.create(name="Other", slug="other")
+        other_comp = Competition.objects.create(
+            organization=other_org, name="Other Cup", slug="other-cup"
+        )
+        oh = Team.objects.create(organization=other_org, name="OH", slug="oh")
+        oa = Team.objects.create(organization=other_org, name="OA", slug="oa")
+        other_comp.teams.add(oh, oa)
+        create_match(competition=other_comp, home_team=oh, away_team=oa)
+
+        resp = self.client.get(self.list_url, {"competition": self.competition.id})
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["competition"]["id"], self.competition.id)
+
+    def test_filter_by_team(self):
+        resp_home = self.client.get(self.list_url, {"team": self.home.id})
+        self.assertEqual(len(resp_home.data), 1)
+
+        resp_away = self.client.get(self.list_url, {"team": self.away.id})
+        self.assertEqual(len(resp_away.data), 1)
+
+        outsider = Team.objects.create(
+            organization=self.org, name="Outsider", slug="outsider"
+        )
+        resp_none = self.client.get(self.list_url, {"team": outsider.id})
+        self.assertEqual(len(resp_none.data), 0)
+
+    def test_filter_by_status(self):
+        Match.objects.filter(pk=self.match.pk).update(status=Match.Status.LIVE)
+        live = self.client.get(self.list_url, {"status": "LIVE"})
+        self.assertEqual(len(live.data), 1)
+        finished = self.client.get(self.list_url, {"status": "FINISHED"})
+        self.assertEqual(len(finished.data), 0)
+
+    # ------------------------------------------------------------------
+    # Detail
+    # ------------------------------------------------------------------
+    def test_detail_is_public(self):
+        resp = self.client.get(
+            reverse("matches:match-detail", args=[self.match.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], self.match.id)
+        for key in (
+            "kickoff_at", "started_at", "finished_at",
+            "created_at", "updated_at", "status_display",
+        ):
+            self.assertIn(key, resp.data)
+
+    def test_detail_404_for_unknown_match(self):
+        resp = self.client.get(reverse("matches:match-detail", args=[999999]))
+        self.assertEqual(resp.status_code, 404)
+
+    # ------------------------------------------------------------------
+    # Create — match
+    # ------------------------------------------------------------------
+    def test_create_match_requires_auth(self):
+        resp = self.client.post(
+            self.list_url,
+            {
+                "competition_id": self.competition.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.away.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_create_match_authenticated(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.list_url,
+            {
+                "competition_id": self.competition.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.away.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["status"], Match.Status.SCHEDULED)
+        self.assertEqual(resp.data["home_team"]["id"], self.home.id)
+        self.assertEqual(resp.data["away_team"]["id"], self.away.id)
+        self.assertEqual(resp.data["competition"]["id"], self.competition.id)
+
+    def test_create_match_rejects_missing_fields(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(self.list_url, {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_match_rejects_same_team(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.list_url,
+            {
+                "competition_id": self.competition.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.home.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_match_rejects_team_outside_competition(self):
+        self.client.force_authenticate(user=self.user)
+        outsider = Team.objects.create(
+            organization=self.org, name="Outsider", slug="outsider"
+        )
+        resp = self.client.post(
+            self.list_url,
+            {
+                "competition_id": self.competition.id,
+                "home_team_id": self.home.id,
+                "away_team_id": outsider.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ------------------------------------------------------------------
+    # Events — listing
+    # ------------------------------------------------------------------
+    def test_events_list_is_public(self):
+        record_match_event(
+            match=self.match,
+            event_type=MatchEvent.Type.GOAL,
+            minute=10,
+            team=self.home,
+            player=self.home_player,
+        )
+        resp = self.client.get(
+            reverse("matches:match-events", args=[self.match.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+        row = resp.data[0]
+        for key in (
+            "id", "type", "minute",
+            "team", "player", "related_player",
+            "description", "created_at",
+        ):
+            self.assertIn(key, row)
+        self.assertEqual(row["type"], "GOAL")
+        self.assertEqual(row["team"]["id"], self.home.id)
+        self.assertEqual(row["player"]["id"], self.home_player.id)
+
+    # ------------------------------------------------------------------
+    # Events — creation
+    # ------------------------------------------------------------------
+    def _event_url(self):
+        return reverse("matches:match-events", args=[self.match.id])
+
+    def test_event_create_requires_auth(self):
+        resp = self.client.post(
+            self._event_url(),
+            {
+                "type": "GOAL",
+                "minute": 10,
+                "team_id": self.home.id,
+                "player_id": self.home_player.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_event_create_goal_updates_score(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._event_url(),
+            {
+                "type": "GOAL",
+                "minute": 10,
+                "team_id": self.home.id,
+                "player_id": self.home_player.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("event", resp.data)
+        self.assertIn("match", resp.data)
+        self.assertEqual(resp.data["match"]["home_score"], 1)
+        self.assertEqual(resp.data["match"]["away_score"], 0)
+        self.assertEqual(resp.data["match"]["status"], Match.Status.LIVE)
+
+    def test_event_create_halftime_then_fulltime_updates_status(self):
+        self.client.force_authenticate(user=self.user)
+
+        r1 = self.client.post(
+            self._event_url(), {"type": "HALFTIME", "minute": 45}, format="json"
+        )
+        self.assertEqual(r1.status_code, 201)
+        self.assertEqual(r1.data["match"]["status"], Match.Status.HALFTIME)
+
+        r2 = self.client.post(
+            self._event_url(), {"type": "FULLTIME", "minute": 90}, format="json"
+        )
+        self.assertEqual(r2.status_code, 201)
+        self.assertEqual(r2.data["match"]["status"], Match.Status.FINISHED)
+        self.assertIsNotNone(r2.data["match"]["finished_at"])
+
+    def test_event_create_rejects_invalid_type(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._event_url(),
+            {"type": "BANANA", "minute": 10},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_event_create_rejects_missing_minute(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._event_url(),
+            {"type": "GOAL", "team_id": self.home.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_event_create_rejects_service_business_rule_violation(self):
+        # GOAL without a team passes the serializer shape but is rejected by
+        # the service layer — proving the view surfaces MatchError as 400.
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._event_url(),
+            {"type": "GOAL", "minute": 10},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_event_create_rejects_lifecycle_violation(self):
+        self.client.force_authenticate(user=self.user)
+        # Full-time the match via service first.
+        record_match_event(
+            match=self.match, event_type=MatchEvent.Type.HALFTIME, minute=45
+        )
+        record_match_event(
+            match=self.match, event_type=MatchEvent.Type.FULLTIME, minute=90
+        )
+        self.match.refresh_from_db()
+
+        resp = self.client.post(
+            self._event_url(),
+            {
+                "type": "GOAL",
+                "minute": 93,
+                "team_id": self.home.id,
+                "player_id": self.home_player.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
