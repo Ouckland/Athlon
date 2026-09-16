@@ -10,6 +10,13 @@ from matches.services import MatchError, create_match, record_match_event
 from rest_framework.test import APIClient
 
 
+from asgiref.sync import async_to_sync, sync_to_async
+from channels.testing import WebsocketCommunicator
+from django.test import TransactionTestCase
+from config.asgi import application
+
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -761,3 +768,222 @@ class MatchAPITests(_Base):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("detail", resp.data)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket / realtime
+# ---------------------------------------------------------------------------
+class MatchWebSocketTests(TransactionTestCase):
+    """
+    Uses TransactionTestCase because the consumer and the test run in different
+    execution contexts; TestCase's outer transaction would hide writes from the
+    Channels worker thread.
+    """
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org", slug="org-ws")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="2026 League", slug="2026-league-ws"
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="Home FC", slug="home-fc-ws"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="Away FC", slug="away-fc-ws"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        self.home_player = Player.objects.create(
+            team=self.home, first_name="H", position=Player.Position.ATT
+        )
+        self.away_player = Player.objects.create(
+            team=self.away, first_name="A", position=Player.Position.MID
+        )
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+        )
+
+    # ------------------------------------------------------------------
+    def _ws_url(self, match_id):
+        return f"/ws/matches/{match_id}/"
+
+    # ------------------------------------------------------------------
+    def test_connect_to_existing_match_receives_initial_state(self):
+        async def run():
+            comm = WebsocketCommunicator(application, self._ws_url(self.match.id))
+            connected, _ = await comm.connect()
+            self.assertTrue(connected)
+
+            msg = await comm.receive_json_from()
+            self.assertEqual(msg["type"], "match_state")
+            self.assertEqual(msg["match"]["id"], self.match.id)
+            self.assertEqual(msg["match"]["status"], Match.Status.SCHEDULED)
+            self.assertEqual(msg["events"], [])
+
+            await comm.disconnect()
+
+        async_to_sync(run)()
+
+    def test_connect_to_unknown_match_is_rejected(self):
+        async def run():
+            comm = WebsocketCommunicator(application, self._ws_url(999999))
+            connected, _ = await comm.connect()
+            self.assertFalse(connected)
+
+        async_to_sync(run)()
+
+    def test_initial_state_includes_existing_events(self):
+        record_match_event(
+            match=self.match,
+            event_type=MatchEvent.Type.GOAL,
+            minute=10,
+            team=self.home,
+            player=self.home_player,
+        )
+
+        async def run():
+            comm = WebsocketCommunicator(application, self._ws_url(self.match.id))
+            await comm.connect()
+            msg = await comm.receive_json_from()
+
+            self.assertEqual(msg["type"], "match_state")
+            self.assertEqual(len(msg["events"]), 1)
+            self.assertEqual(msg["events"][0]["type"], "GOAL")
+            self.assertEqual(msg["match"]["home_score"], 1)
+
+            await comm.disconnect()
+
+        async_to_sync(run)()
+
+    def test_successful_event_broadcasts_to_connected_client(self):
+        async def run():
+            comm = WebsocketCommunicator(application, self._ws_url(self.match.id))
+            await comm.connect()
+            await comm.receive_json_from()  # drain initial state
+
+            # Trigger the real service — this is the exact path the DRF view
+            # uses. Run it in a worker thread so it doesn't block the loop.
+            await sync_to_async(record_match_event)(
+                match=self.match,
+                event_type=MatchEvent.Type.GOAL,
+                minute=10,
+                team=self.home,
+                player=self.home_player,
+            )
+
+            msg = await comm.receive_json_from()
+            self.assertEqual(msg["type"], "match_event")
+            self.assertEqual(msg["event"]["type"], "GOAL")
+            self.assertEqual(msg["event"]["player"]["id"], self.home_player.id)
+            self.assertEqual(msg["match"]["home_score"], 1)
+            self.assertEqual(msg["match"]["status"], Match.Status.LIVE)
+
+            await comm.disconnect()
+
+        async_to_sync(run)()
+
+    def test_clients_on_other_matches_do_not_receive_event(self):
+        other_match = create_match(
+            competition=self.competition,
+            home_team=self.away,
+            away_team=self.home,
+        )
+
+        async def run():
+            comm = WebsocketCommunicator(
+                application, self._ws_url(other_match.id)
+            )
+            await comm.connect()
+            await comm.receive_json_from()  # drain initial state
+
+            # Record an event against the FIRST match — the second client
+            # must not receive it.
+            await sync_to_async(record_match_event)(
+                match=self.match,
+                event_type=MatchEvent.Type.GOAL,
+                minute=10,
+                team=self.home,
+                player=self.home_player,
+            )
+
+            got_nothing = await comm.receive_nothing(timeout=0.3)
+            self.assertTrue(got_nothing)
+
+            await comm.disconnect()
+
+        async_to_sync(run)()
+
+        def test_rolled_back_transaction_does_not_broadcast(self):
+            """
+            event creation wrapped in an outer atomic() block that rolls back
+            must NOT produce a WebSocket broadcast, because the broadcast is
+            registered via transaction.on_commit().
+            """
+            async def run():
+                comm = WebsocketCommunicator(application, self._ws_url(self.match.id))
+                await comm.connect()
+                await comm.receive_json_from()  # drain initial match_state
+
+                def _create_then_rollback():
+                    from django.db import transaction
+                    try:
+                        with transaction.atomic():
+                            record_match_event(
+                                match=self.match,
+                                event_type=MatchEvent.Type.GOAL,
+                                minute=10,
+                                team=self.home,
+                                player=self.home_player,
+                            )
+                            raise RuntimeError("force outer rollback")
+                    except RuntimeError:
+                        pass
+
+                await sync_to_async(_create_then_rollback)()
+
+                got_nothing = await comm.receive_nothing(timeout=0.5)
+                self.assertTrue(
+                    got_nothing,
+                    "Rolled-back event must not be broadcast to WebSocket clients.",
+                )
+
+                # And the DB must have no event either.
+                count = await sync_to_async(
+                    lambda: MatchEvent.objects.filter(match=self.match).count()
+                )()
+                self.assertEqual(count, 0)
+
+                await comm.disconnect()
+
+            async_to_sync(run)()
+        
+    def test_invalid_event_does_not_broadcast(self):
+        async def run():
+            comm = WebsocketCommunicator(application, self._ws_url(self.match.id))
+            await comm.connect()
+            await comm.receive_json_from()  # drain initial state
+
+            def _try_invalid():
+                try:
+                    record_match_event(
+                        match=self.match,
+                        event_type=MatchEvent.Type.GOAL,
+                        minute=10,
+                        # no team — service rejects with MatchError
+                    )
+                except MatchError:
+                    return "rejected"
+                return "unexpected"
+
+            outcome = await sync_to_async(_try_invalid)()
+            self.assertEqual(outcome, "rejected")
+
+            got_nothing = await comm.receive_nothing(timeout=0.3)
+            self.assertTrue(got_nothing)
+
+            await comm.disconnect()
+
+        async_to_sync(run)()
