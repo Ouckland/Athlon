@@ -491,7 +491,9 @@ class MatchAPITests(_Base):
         super().setUp()
         self.client = APIClient()
         self.user = User.objects.create_user(
-            email="matches-api@example.com", password="StrongPass!23"
+            email="matches-api@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
         )
         self.list_url = reverse("matches:match-list")
 
@@ -571,7 +573,7 @@ class MatchAPITests(_Base):
     # ------------------------------------------------------------------
     # Create — match
     # ------------------------------------------------------------------
-    def test_create_match_requires_auth(self):
+    def test_create_match_forbidden_without_auth(self):
         resp = self.client.post(
             self.list_url,
             {
@@ -581,7 +583,7 @@ class MatchAPITests(_Base):
             },
             format="json",
         )
-        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.status_code, 403)
 
     def test_create_match_authenticated(self):
         self.client.force_authenticate(user=self.user)
@@ -667,7 +669,7 @@ class MatchAPITests(_Base):
     def _event_url(self):
         return reverse("matches:match-events", args=[self.match.id])
 
-    def test_event_create_requires_auth(self):
+    def test_event_create_forbidden_without_auth(self):
         resp = self.client.post(
             self._event_url(),
             {
@@ -678,8 +680,8 @@ class MatchAPITests(_Base):
             },
             format="json",
         )
-        self.assertEqual(resp.status_code, 401)
-
+        self.assertEqual(resp.status_code, 403)
+        
     def test_event_create_goal_updates_score(self):
         self.client.force_authenticate(user=self.user)
         resp = self.client.post(
@@ -987,3 +989,113 @@ class MatchWebSocketTests(TransactionTestCase):
             await comm.disconnect()
 
         async_to_sync(run)()
+
+
+class MatchAuthorizationTests(_Base):
+    """
+    MVP authorization for match operational actions.
+
+    - anonymous writes        -> 401
+    - authenticated USER      -> 403
+    - SCOUT                   -> allowed
+    - ADMIN                   -> allowed
+    - reads remain public
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+
+        self.plain_user = User.objects.create_user(
+            email="plain@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.scout = User.objects.create_user(
+            email="scout@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.admin = User.objects.create_user(
+            email="admin@example.com",
+            password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+
+        self.matches_url = reverse("matches:match-list")
+        self.events_url = reverse("matches:match-events", args=[self.match.id])
+
+        self.match_payload = {
+            "competition_id": self.competition.id,
+            "home_team_id": self.home.id,
+            "away_team_id": self.away.id,
+        }
+        self.event_payload = {
+            "type": "GOAL",
+            "minute": 10,
+            "team_id": self.home.id,
+            "player_id": self.home_player.id,
+        }
+
+    # ------------------------------------------------------------------
+    # Match creation
+    # ------------------------------------------------------------------
+    def test_create_match_anonymous_forbidden(self):
+        resp = self.client.post(self.matches_url, self.match_payload, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_create_match_plain_user_403(self):
+        self.client.force_authenticate(user=self.plain_user)
+        resp = self.client.post(self.matches_url, self.match_payload, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_create_match_scout_201(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.post(self.matches_url, self.match_payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+
+    def test_create_match_admin_201(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(self.matches_url, self.match_payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+
+    # ------------------------------------------------------------------
+    # Event creation
+    # ------------------------------------------------------------------
+    def test_create_event_anonymous_forbidden(self):
+            resp = self.client.post(self.events_url, self.event_payload, format="json")
+            self.assertEqual(resp.status_code, 403)
+
+    def test_create_event_plain_user_403(self):
+        self.client.force_authenticate(user=self.plain_user)
+        resp = self.client.post(self.events_url, self.event_payload, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_create_event_scout_201(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.post(self.events_url, self.event_payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["event"]["type"], "GOAL")
+
+    def test_create_event_admin_201(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(self.events_url, self.event_payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["event"]["type"], "GOAL")
+
+    # ------------------------------------------------------------------
+    # Public reads unchanged
+    # ------------------------------------------------------------------
+    def test_anonymous_can_list_matches(self):
+        resp = self.client.get(self.matches_url)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_anonymous_can_view_match_detail(self):
+        resp = self.client.get(
+            reverse("matches:match-detail", args=[self.match.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_anonymous_can_list_events(self):
+        resp = self.client.get(self.events_url)
+        self.assertEqual(resp.status_code, 200)
