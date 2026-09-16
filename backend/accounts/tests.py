@@ -3,10 +3,11 @@ from django.db import IntegrityError
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
-from django.core import mail
 from django.test import override_settings
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
+
+from unittest import mock
 
 from .services.users import generate_email_verification_token, generate_password_reset_token
 
@@ -58,6 +59,10 @@ class UserModelTests(TestCase):
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+@override_settings(BREVO_API_KEY="")
 class RegistrationTests(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -246,30 +251,39 @@ class EmailVerificationTests(TestCase):
 # ---------------------------------------------------------------------------
 # Resend verification
 # ---------------------------------------------------------------------------
+@override_settings(BREVO_API_KEY="test-key")
 class ResendVerificationTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.url = reverse("accounts:resend-verification")
 
-    def test_unverified_user_receives_email(self):
+    @mock.patch("accounts.services.email.requests.post")
+    def test_unverified_user_receives_email(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
         User.objects.create_user(email="r@example.com", password="StrongPass!23")
-        mail.outbox.clear()
+
         resp = self.client.post(self.url, {"email": "r@example.com"}, format="json")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn("r@example.com", mail.outbox[0].to)
+        self.assertEqual(mock_post.call_count, 1)
 
-    def test_verified_user_receives_no_email(self):
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["to"][0]["email"], "r@example.com")
+        self.assertIn("Verify", payload["subject"])
+        self.assertIn("htmlContent", payload)
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_verified_user_receives_no_email(self, mock_post):
         user = User.objects.create_user(email="v@example.com", password="StrongPass!23")
         user.email_verified = True
         user.save()
-        mail.outbox.clear()
+
         resp = self.client.post(self.url, {"email": "v@example.com"}, format="json")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(mail.outbox), 0)
+        mock_post.assert_not_called()
 
-    def test_nonexistent_email_returns_same_response(self):
-        mail.outbox.clear()
+    @mock.patch("accounts.services.email.requests.post")
+    def test_nonexistent_email_returns_same_response(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
         resp1 = self.client.post(self.url, {"email": "ghost@example.com"}, format="json")
         User.objects.create_user(email="real@example.com", password="StrongPass!23")
         resp2 = self.client.post(self.url, {"email": "real@example.com"}, format="json")
@@ -280,35 +294,43 @@ class ResendVerificationTests(TestCase):
 # ---------------------------------------------------------------------------
 # Forgot password
 # ---------------------------------------------------------------------------
+@override_settings(BREVO_API_KEY="test-key")
 class ForgotPasswordTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.url = reverse("accounts:forgot-password")
 
-    def test_existing_email_triggers_email(self):
+    @mock.patch("accounts.services.email.requests.post")
+    def test_existing_email_triggers_email(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
         User.objects.create_user(email="f@example.com", password="StrongPass!23")
-        mail.outbox.clear()
+
         resp = self.client.post(self.url, {"email": "f@example.com"}, format="json")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn("reset", mail.outbox[0].subject.lower())
+        self.assertEqual(mock_post.call_count, 1)
 
-    def test_nonexistent_email_same_response(self):
-        mail.outbox.clear()
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["to"][0]["email"], "f@example.com")
+        self.assertIn("Reset", payload["subject"])
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_nonexistent_email_same_response(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
         resp1 = self.client.post(self.url, {"email": "ghost@example.com"}, format="json")
         User.objects.create_user(email="real@example.com", password="StrongPass!23")
         resp2 = self.client.post(self.url, {"email": "real@example.com"}, format="json")
         self.assertEqual(resp1.status_code, resp2.status_code)
         self.assertEqual(resp1.data, resp2.data)
 
-    def test_inactive_user_no_email(self):
+    @mock.patch("accounts.services.email.requests.post")
+    def test_inactive_user_no_email(self, mock_post):
         user = User.objects.create_user(email="x@example.com", password="StrongPass!23")
         user.is_active = False
         user.save()
-        mail.outbox.clear()
+
         resp = self.client.post(self.url, {"email": "x@example.com"}, format="json")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(mail.outbox), 0)
+        mock_post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +408,143 @@ class ResetPasswordTests(TestCase):
         self.client.post(self.url, self._payload(), format="json")
         resp = self.client.post(self.url, self._payload(), format="json")
         self.assertEqual(resp.status_code, 400)
+
+# ---------------------------------------------------------------------------
+# Verification email service (direct Brevo HTTP)
+# ---------------------------------------------------------------------------
+@override_settings(
+    FRONTEND_BASE_URL="https://app.athlon.test",
+    BREVO_API_KEY="test-key",
+)
+class VerificationEmailServiceTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="verify@example.com",
+            password="StrongPass!23",
+            display_name="V",
+        )
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_verification_email_uses_configured_base_url(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
+        from .services.email import send_verification_email
+
+        send_verification_email(self.user, "tok123")
+        payload = mock_post.call_args.kwargs["json"]
+
+        self.assertEqual(payload["to"][0]["email"], "verify@example.com")
+        self.assertEqual(payload["subject"], "Verify your Athlon email")
+        self.assertIn(
+            "https://app.athlon.test/verify-email/tok123", payload["htmlContent"]
+        )
+        self.assertIn(
+            "https://app.athlon.test/verify-email/tok123", payload["textContent"]
+        )
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_verification_email_mentions_expiry(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
+        from .services.email import send_verification_email
+
+        send_verification_email(self.user, "tok123")
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertIn("expires in", payload["htmlContent"].lower())
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_brevo_posts_to_correct_endpoint_with_api_key(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
+        from .services.email import send_verification_email
+
+        send_verification_email(self.user, "tok123")
+        call = mock_post.call_args
+        self.assertEqual(call.args[0], "https://api.brevo.com/v3/smtp/email")
+        self.assertEqual(call.kwargs["headers"]["api-key"], "test-key")
+        self.assertEqual(call.kwargs["headers"]["content-type"], "application/json")
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_registration_sends_verification_via_brevo(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=201, text="OK")
+        client = APIClient()
+        resp = client.post(
+            reverse("accounts:register"),
+            {
+                "email": "newuser@example.com",
+                "password": "StrongPass!23",
+                "password_confirmation": "StrongPass!23",
+                "display_name": "New",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(mock_post.call_count, 1)
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["to"][0]["email"], "newuser@example.com")
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_brevo_request_exception_does_not_break_registration(self, mock_post):
+        import requests as _requests
+
+        mock_post.side_effect = _requests.RequestException("brevo down")
+        client = APIClient()
+        resp = client.post(
+            reverse("accounts:register"),
+            {
+                "email": "breaker@example.com",
+                "password": "StrongPass!23",
+                "password_confirmation": "StrongPass!23",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        user = User.objects.get(email="breaker@example.com")
+        self.assertFalse(user.email_verified)
+        self.assertIsNone(user.email_verified_at)
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_brevo_400_does_not_break_registration(self, mock_post):
+        mock_post.return_value = mock.MagicMock(status_code=400, text="bad sender")
+        client = APIClient()
+        resp = client.post(
+            reverse("accounts:register"),
+            {
+                "email": "bad-sender@example.com",
+                "password": "StrongPass!23",
+                "password_confirmation": "StrongPass!23",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+
+# ---------------------------------------------------------------------------
+# Dev fallback (no BREVO_API_KEY -> no HTTP call)
+# ---------------------------------------------------------------------------
+@override_settings(BREVO_API_KEY="")
+class DevFallbackEmailTests(TestCase):
+    """When BREVO_API_KEY is unset, no HTTP call is made."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email="dev@example.com", password="StrongPass!23"
+        )
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_no_api_call_without_key(self, mock_post):
+        from .services.email import send_verification_email
+        send_verification_email(self.user, "tok")
+        mock_post.assert_not_called()
+
+    @mock.patch("accounts.services.email.requests.post")
+    def test_registration_succeeds_without_key(self, mock_post):
+        client = APIClient()
+        resp = client.post(
+            reverse("accounts:register"),
+            {
+                "email": "dev-reg@example.com",
+                "password": "StrongPass!23",
+                "password_confirmation": "StrongPass!23",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        mock_post.assert_not_called()
