@@ -86,16 +86,61 @@ def create_match(*, competition, home_team, away_team, kickoff_at=None):
     )
 
 
+def _post_commit_side_effects(event):
+    """
+    Runs once the record_match_event() transaction has committed.
+
+    Order is deliberate:
+      1. Fantasy points are recalculated for the match.
+      2. The match/event update is broadcast over WebSocket.
+
+    Recalculating first guarantees that by the time a connected client
+    receives the live match update, the fantasy points it depends on are
+    already persisted.
+
+    Both steps are individually guarded so a failure in one never affects
+    the other, and neither can invalidate the committed MatchEvent.
+    """
+    _safe_recalculate_fantasy(event.match_id)
+    _safe_broadcast_event(event)
+
+
+def _safe_recalculate_fantasy(match_id):
+    """
+    Recalculate FantasyPoints for `match_id` using the Fantasy scoring
+    service as the sole source of truth.
+
+    A local import is used deliberately: `fantasy.services.scoring` imports
+    `matches.models`, and `matches.services.matches` is loaded during app
+    startup. Keeping the import inside the callback body avoids a module-level
+    cycle and also defers the cost until the first committed event.
+
+    Any failure here is logged and swallowed — a broken fantasy layer must
+    never break match-event recording.
+    """
+    try:
+        from matches.models import Match
+        from fantasy.services.scoring import recalculate_match_points
+
+        match = Match.objects.get(pk=match_id)
+        recalculate_match_points(match)
+    except Exception:
+        logger.exception(
+            "Failed to recalculate fantasy points for match %s", match_id
+        )
+
+
 def _safe_broadcast_event(event):
     """
     Broadcast a MatchEvent to WebSocket subscribers.
 
-    Invoked via transaction.on_commit() so it only runs after the surrounding
-    database transaction has committed. Any failure here must never propagate
-    back into the committed match-event flow.
+    Kept separate from fantasy recalculation so a channel-layer failure
+    cannot prevent scoring, and vice versa. Any failure is logged and
+    swallowed.
     """
     try:
         from matches.realtime import broadcast_match_event
+
         broadcast_match_event(event)
     except Exception:
         logger.exception(
@@ -152,7 +197,7 @@ def record_match_event(
     
     # Broadcast only after the DB transaction that wraps this call commits.
     # If an outer transaction rolls back, this callback never fires.
-    transaction.on_commit(lambda: _safe_broadcast_event(event))
+    transaction.on_commit(lambda: _post_commit_side_effects(event))
 
     return event
 
