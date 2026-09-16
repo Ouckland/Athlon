@@ -1,7 +1,13 @@
+import logging
 from django.db import transaction
 from django.utils import timezone
 
 from matches.models import Match, MatchEvent
+ 
+
+
+logger = logging.getLogger(__name__)
+
 
 
 class MatchError(Exception):
@@ -80,6 +86,24 @@ def create_match(*, competition, home_team, away_team, kickoff_at=None):
     )
 
 
+def _safe_broadcast_event(event):
+    """
+    Broadcast a MatchEvent to WebSocket subscribers.
+
+    Invoked via transaction.on_commit() so it only runs after the surrounding
+    database transaction has committed. Any failure here must never propagate
+    back into the committed match-event flow.
+    """
+    try:
+        from matches.realtime import broadcast_match_event
+        broadcast_match_event(event)
+    except Exception:
+        logger.exception(
+            "Failed to broadcast MatchEvent %s for match %s",
+            event.pk,
+            event.match_id,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Events
@@ -125,6 +149,10 @@ def record_match_event(
             _recalculate_score(match)
 
         _apply_event_to_match(match, event)
+    
+    # Broadcast only after the DB transaction that wraps this call commits.
+    # If an outer transaction rolls back, this callback never fires.
+    transaction.on_commit(lambda: _safe_broadcast_event(event))
 
     return event
 
