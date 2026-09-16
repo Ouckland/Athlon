@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.urls import reverse  # noqa: F401  (kept for symmetry with other apps)
-
+from rest_framework.test import APIClient
 from league.models import Competition, Organization, Player, Team
 from matches.models import Match, MatchEvent
 
@@ -552,3 +552,280 @@ class GroupTests(FantasyTestBase):
         team_ids = {r["fantasy_team"].id for r in rows}
         self.assertIn(owner_team.id, team_ids)
         self.assertNotIn(outsider_team.id, team_ids)
+
+# ---------------------------------------------------------------------------
+# API base
+# ---------------------------------------------------------------------------
+class FantasyAPITestBase(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+
+# ---------------------------------------------------------------------------
+# Fantasy team + squad API
+# ---------------------------------------------------------------------------
+class FantasyTeamAPITests(FantasyAPITestBase):
+    def _team_url(self):
+        return reverse("fantasy:team")
+
+    def _squad_url(self):
+        return reverse("fantasy:squad")
+
+    # -- auth -------------------------------------------------------------
+    def test_anonymous_cannot_access_team(self):
+        anon = APIClient()
+        resp = anon.get(self._team_url())
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_anonymous_cannot_create_team(self):
+        anon = APIClient()
+        resp = anon.post(self._team_url(), {"name": "X"}, format="json")
+        self.assertIn(resp.status_code, (401, 403))
+
+    # -- create / retrieve ------------------------------------------------
+    def test_get_team_404_before_creation(self):
+        resp = self.client.get(self._team_url())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_create_team(self):
+        resp = self.client.post(self._team_url(), {"name": "My Team"}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["name"], "My Team")
+        self.assertIn("starters", resp.data)
+        self.assertIn("bench", resp.data)
+        self.assertIsNone(resp.data["captain_id"])
+        self.assertEqual(resp.data["total_points"], 0)
+
+    def test_create_team_twice_rejected(self):
+        self.client.post(self._team_url(), {"name": "A"}, format="json")
+        resp = self.client.post(self._team_url(), {"name": "B"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_get_team_after_creation(self):
+        self.client.post(self._team_url(), {"name": "My Team"}, format="json")
+        resp = self.client.get(self._team_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["name"], "My Team")
+
+    # -- update -----------------------------------------------------------
+    def test_patch_team_name(self):
+        self.client.post(self._team_url(), {"name": "Old"}, format="json")
+        resp = self.client.patch(self._team_url(), {"name": "New"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["name"], "New")
+
+    def test_patch_without_team_404(self):
+        resp = self.client.patch(self._team_url(), {"name": "New"}, format="json")
+        self.assertEqual(resp.status_code, 404)
+
+    # -- squad ------------------------------------------------------------
+    def test_get_squad_404_without_team(self):
+        resp = self.client.get(self._squad_url())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_put_valid_squad(self):
+        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        players, selections = self._make_valid_squad()
+        resp = self.client.put(
+            self._squad_url(), {"selections": selections}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["starters"]), STARTERS)
+        self.assertEqual(len(resp.data["bench"]), BENCH)
+        self.assertEqual(resp.data["captain_id"], players[0].id)
+
+    def test_put_invalid_squad_rejected(self):
+        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        # Only 14 players
+        _, selections = self._make_valid_squad()
+        resp = self.client.put(
+            self._squad_url(),
+            {"selections": selections[:-1]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_put_missing_captain_rejected(self):
+        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        _, selections = self._make_valid_squad()
+        for s in selections:
+            s["is_captain"] = False
+        resp = self.client.put(
+            self._squad_url(), {"selections": selections}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_put_squad_malformed_shape_rejected(self):
+        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        resp = self.client.put(
+            self._squad_url(), {"selections": "not-a-list"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_get_squad_after_put(self):
+        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        _, selections = self._make_valid_squad()
+        self.client.put(
+            self._squad_url(), {"selections": selections}, format="json"
+        )
+        resp = self.client.get(self._squad_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["starters"]) + len(resp.data["bench"]), SQUAD_SIZE)
+
+
+# ---------------------------------------------------------------------------
+# Fantasy groups API
+# ---------------------------------------------------------------------------
+class FantasyGroupAPITests(FantasyAPITestBase):
+    def _groups_url(self):
+        return reverse("fantasy:group-list")
+
+    def _join_url(self):
+        return reverse("fantasy:group-join")
+
+    def test_anonymous_cannot_list_groups(self):
+        anon = APIClient()
+        resp = anon.get(self._groups_url())
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_create_group(self):
+        resp = self.client.post(self._groups_url(), {"name": "Fam"}, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["name"], "Fam")
+        self.assertEqual(resp.data["owner_email"], self.user.email)
+        self.assertEqual(resp.data["member_count"], 1)
+        self.assertEqual(len(resp.data["invite_code"]), 8)
+
+    def test_list_only_my_groups(self):
+        # Group A: user is a member (created)
+        self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+
+        # Group B: created by another user, current user NOT a member
+        outsider = User.objects.create_user(
+            email="other@example.com", password="StrongPass!23"
+        )
+        create_group(owner=outsider, name="NotMine")
+
+        resp = self.client.get(self._groups_url())
+        self.assertEqual(resp.status_code, 200)
+        names = [g["name"] for g in resp.data]
+        self.assertEqual(names, ["Mine"])
+
+    def test_join_group_with_invite_code(self):
+        owner = User.objects.create_user(
+            email="owner@example.com", password="StrongPass!23"
+        )
+        group = create_group(owner=owner, name="Crew")
+
+        resp = self.client.post(
+            self._join_url(), {"invite_code": group.invite_code}, format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["id"], group.id)
+
+    def test_duplicate_join_rejected(self):
+        owner = User.objects.create_user(
+            email="owner2@example.com", password="StrongPass!23"
+        )
+        group = create_group(owner=owner, name="Crew")
+        self.client.post(
+            self._join_url(), {"invite_code": group.invite_code}, format="json"
+        )
+        resp = self.client.post(
+            self._join_url(), {"invite_code": group.invite_code}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_invalid_invite_code_rejected(self):
+        resp = self.client.post(
+            self._join_url(), {"invite_code": "NOPE0000"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_group_detail_requires_membership(self):
+        owner = User.objects.create_user(
+            email="owner3@example.com", password="StrongPass!23"
+        )
+        group = create_group(owner=owner, name="Private")
+        resp = self.client.get(
+            reverse("fantasy:group-detail", args=[group.id])
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_group_detail_ok_for_member(self):
+        resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+        gid = resp.data["id"]
+        resp = self.client.get(reverse("fantasy:group-detail", args=[gid]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], gid)
+
+    def test_group_leaderboard_requires_membership(self):
+        owner = User.objects.create_user(
+            email="owner4@example.com", password="StrongPass!23"
+        )
+        group = create_group(owner=owner, name="Private")
+        resp = self.client.get(
+            reverse("fantasy:group-leaderboard", args=[group.id])
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_group_leaderboard_for_member(self):
+        resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+        gid = resp.data["id"]
+        resp = self.client.get(
+            reverse("fantasy:group-leaderboard", args=[gid])
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["group_id"], gid)
+        self.assertIn("rows", resp.data)
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard API
+# ---------------------------------------------------------------------------
+class FantasyLeaderboardAPITests(FantasyAPITestBase):
+    def test_anonymous_cannot_view_global_leaderboard(self):
+        anon = APIClient()
+        resp = anon.get(reverse("fantasy:global-leaderboard"))
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_global_leaderboard_lists_teams(self):
+        # Create a team + valid squad; no events -> 0 points.
+        self.client.post(reverse("fantasy:team"), {"name": "Alpha"}, format="json")
+        _, selections = self._make_valid_squad()
+        self.client.put(
+            reverse("fantasy:squad"), {"selections": selections}, format="json"
+        )
+
+        resp = self.client.get(reverse("fantasy:global-leaderboard"))
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.data["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["rank"], 1)
+        self.assertEqual(rows[0]["name"], "Alpha")
+        self.assertEqual(rows[0]["total_points"], 0)
+
+
+# ---------------------------------------------------------------------------
+# FantasyPoints are read-only (no API writes)
+# ---------------------------------------------------------------------------
+class FantasyPointsReadOnlyTests(FantasyAPITestBase):
+    def test_no_fantasy_points_endpoint_exists(self):
+        # POST to a plausible points URL -> 404, no route.
+        resp = self.client.post("/api/fantasy/points/", {}, format="json")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_fantasy_points_not_creatable_via_squad_endpoint(self):
+        self.client.post(reverse("fantasy:team"), {"name": "T"}, format="json")
+        _, selections = self._make_valid_squad()
+
+        # Try to sneak points in — must be ignored, no FantasyPoints created.
+        payload = {"selections": selections, "points": 999}
+        resp = self.client.put(
+            reverse("fantasy:squad"), payload, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(FantasyPoints.objects.count(), 0)
