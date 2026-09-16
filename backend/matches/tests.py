@@ -5,6 +5,8 @@ from django.test import TestCase
 from django.utils import timezone
 
 from league.models import Competition, Organization, Player, Team
+
+from fantasy.models import FantasyPoints
 from matches.models import Match, MatchEvent
 from matches.services import MatchError, create_match, record_match_event
 from rest_framework.test import APIClient
@@ -989,6 +991,159 @@ class MatchWebSocketTests(TransactionTestCase):
             await comm.disconnect()
 
         async_to_sync(run)()
+
+
+# ---------------------------------------------------------------------------
+# MatchEvent → FantasyPoints integration
+# ---------------------------------------------------------------------------
+class MatchEventFantasyIntegrationTests(TestCase):
+    """
+    Verifies that recording a MatchEvent via the matches service triggers a
+    FantasyPoints recalculation after the transaction commits.
+
+    Uses captureOnCommitCallbacks(execute=True) because TestCase wraps each
+    test in a transaction that never actually commits — without it, the
+    on_commit callback would be queued but never run.
+    """
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org", slug="org-int")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="League", slug="league-int"
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="Home", slug="home-int"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="Away", slug="away-int"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        self.home_att = Player.objects.create(
+            team=self.home, first_name="H", position=Player.Position.ATT
+        )
+        self.away_att = Player.objects.create(
+            team=self.away, first_name="A", position=Player.Position.ATT
+        )
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+        )
+
+    def _record(self, **kwargs):
+        # Wraps each service call so its on_commit callback actually fires.
+        with self.captureOnCommitCallbacks(execute=True):
+            return record_match_event(match=self.match, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Happy paths
+    # ------------------------------------------------------------------
+    def test_goal_creates_fantasy_points(self):
+        self._record(
+            event_type=MatchEvent.Type.GOAL,
+            minute=10,
+            team=self.home,
+            player=self.home_att,
+        )
+        fp = FantasyPoints.objects.get(match=self.match, player=self.home_att)
+        # ATT goal 4 + appearance 1 + 60+ minutes 1 = 6
+        self.assertEqual(fp.points, 6)
+
+    def test_away_goal_creates_fantasy_points(self):
+        self._record(
+            event_type=MatchEvent.Type.GOAL,
+            minute=20,
+            team=self.away,
+            player=self.away_att,
+        )
+        fp = FantasyPoints.objects.get(match=self.match, player=self.away_att)
+        self.assertEqual(fp.points, 6)
+
+    def test_yellow_card_updates_fantasy_points(self):
+        self._record(
+            event_type=MatchEvent.Type.YELLOW,
+            minute=30,
+            team=self.home,
+            player=self.home_att,
+        )
+        fp = FantasyPoints.objects.get(match=self.match, player=self.home_att)
+        # appearance 1 + 60+ 1 + yellow -1 = 1
+        self.assertEqual(fp.points, 1)
+
+    def test_red_card_updates_fantasy_points(self):
+        self._record(
+            event_type=MatchEvent.Type.RED,
+            minute=30,
+            team=self.home,
+            player=self.home_att,
+        )
+        fp = FantasyPoints.objects.get(match=self.match, player=self.home_att)
+        # appearance 1 + 60+ 1 + red -3 = -1
+        self.assertEqual(fp.points, -1)
+
+    def test_multiple_events_accumulate_and_are_idempotent(self):
+        self._record(
+            event_type=MatchEvent.Type.GOAL,
+            minute=10,
+            team=self.home,
+            player=self.home_att,
+        )
+        self._record(
+            event_type=MatchEvent.Type.GOAL,
+            minute=40,
+            team=self.home,
+            player=self.home_att,
+        )
+        fp = FantasyPoints.objects.get(match=self.match, player=self.home_att)
+        # 2 * 4 goals + appearance 1 + 60+ 1 = 10
+        self.assertEqual(fp.points, 10)
+
+        # Recalculate wipes and re-derives rows, so re-fetch instead of
+        # refresh_from_db() — the old instance's pk no longer exists.
+        from fantasy.services import recalculate_match_points
+        recalculate_match_points(self.match)
+
+        fp = FantasyPoints.objects.get(match=self.match, player=self.home_att)
+        self.assertEqual(fp.points, 10)
+
+    def test_event_for_player_with_no_prior_row_creates_one(self):
+        self.assertEqual(
+            FantasyPoints.objects.filter(match=self.match).count(), 0
+        )
+        self._record(
+            event_type=MatchEvent.Type.GOAL,
+            minute=10,
+            team=self.home,
+            player=self.home_att,
+        )
+        self.assertEqual(
+            FantasyPoints.objects.filter(match=self.match).count(), 1
+        )
+
+    # ------------------------------------------------------------------
+    # Transaction safety
+    # ------------------------------------------------------------------
+    def test_rolled_back_transaction_does_not_persist_fantasy_points(self):
+        with self.assertRaises(RuntimeError):
+            with transaction.atomic():
+                record_match_event(
+                    match=self.match,
+                    event_type=MatchEvent.Type.GOAL,
+                    minute=10,
+                    team=self.home,
+                    player=self.home_att,
+                )
+                raise RuntimeError("force outer rollback")
+
+        self.assertEqual(
+            MatchEvent.objects.filter(match=self.match).count(), 0
+        )
+        self.assertEqual(
+            FantasyPoints.objects.filter(match=self.match).count(), 0
+        )
+
 
 
 class MatchAuthorizationTests(_Base):
