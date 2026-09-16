@@ -209,20 +209,27 @@ MEDIA_ROOT = BASE_DIR / "media"
 # =============================================================================
 # =============================================================================
 # EMAIL
+import os
 
+# ---------------------------------------------------------------------------
+# Email — Brevo HTTP API (direct)
+# ---------------------------------------------------------------------------
 
-# Frontend base URL used when building links inside outgoing emails.
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
-
-# Email verification token lifetime (seconds). Default: 3 days.
-EMAIL_VERIFICATION_TIMEOUT = int(
-    os.environ.get("EMAIL_VERIFICATION_TIMEOUT", 60 * 60 * 24 * 3)
+DEFAULT_FROM_EMAIL = os.environ.get(
+    "DEFAULT_FROM_EMAIL", "Athlon <no-reply@athlon.local>"
 )
+DEFAULT_FROM_NAME = os.environ.get("DEFAULT_FROM_NAME", "Athlon")
 
-# Default From: header used by account emails.
-DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Athlon <no-reply@athlon.local>")
+# Brevo transactional API. Leave BREVO_API_KEY unset in local dev —
+# the email service logs to console instead of making HTTP calls.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+BREVO_API_TIMEOUT = int(os.environ.get("BREVO_API_TIMEOUT", "15"))
 
-EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+# Kept only so any future send_mail() call has a sane default. Nothing in
+# accounts uses it anymore.
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+)
 
 # =============================================================================
 # DEFAULT PRIMARY KEY
