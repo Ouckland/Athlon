@@ -19,7 +19,9 @@ from .models import (
     FantasyPoints,
     FantasyTeam,
     FantasyPlayerPrice,
+    FantasyTransfer
 )
+
 from .constants import DEFAULT_STARTING_BUDGET, MAX_PLAYER_PRICE
 from .services import (
     BENCH,
@@ -47,6 +49,7 @@ from .services import (
     get_player_price,
     set_player_price,
     squad_total_cost,
+    make_transfer, transfers_remaining, transfers_used
 )
 
 User = get_user_model()
@@ -55,8 +58,6 @@ POSITIONS_15 = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
 
 
 from decimal import Decimal
-
-
 
 
 
@@ -1876,3 +1877,466 @@ class GameweekLockingTests(FantasyTestBase):
             .values_list("player_id", flat=True)
         )
         self.assertEqual(before, after)
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Transfers
+# ---------------------------------------------------------------------------
+class TransferServiceTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        set_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        # Layout of _make_valid_squad's flat list:
+        #   [0]  GK starter, captain
+        #   [1]  GK starter
+        #   [2-6] DEF starter
+        #   [7-10] MID starter
+        #   [11] MID bench
+        #   [12-14] ATT bench
+
+    def _outsider(self, position, name, price=Decimal("5.0")):
+        return self._player(self.away, position, name, price=price)
+
+    def _set_team_budget(self, value):
+        self.team.starting_budget = value
+        self.team.save(update_fields=["starting_budget"])
+
+    # -- success paths ----------------------------------------------------
+    def test_successful_transfer_replaces_player(self):
+        new_mid = self._outsider("MID", "NewMID")
+        transfer = make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=new_mid,
+        )
+        self.assertIsNotNone(transfer.id)
+        ids = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertNotIn(self.players[11].id, ids)
+        self.assertIn(new_mid.id, ids)
+
+    def test_incoming_takes_bench_slot(self):
+        new_mid = self._outsider("MID", "NewMID")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],  # bench MID
+            player_in=new_mid,
+        )
+        row = self.team.selections.get(stage=self.stage, player=new_mid)
+        self.assertFalse(row.is_starter)
+        self.assertFalse(row.is_captain)
+
+    def test_incoming_takes_starter_slot(self):
+        new_mid = self._outsider("MID", "NewMID")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[7],  # starter MID
+            player_in=new_mid,
+        )
+        row = self.team.selections.get(stage=self.stage, player=new_mid)
+        self.assertTrue(row.is_starter)
+
+    def test_transfer_record_created(self):
+        new_mid = self._outsider("MID", "NewMID")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=new_mid,
+        )
+        self.assertEqual(
+            FantasyTransfer.objects.filter(
+                fantasy_team=self.team, stage=self.stage
+            ).count(),
+            1,
+        )
+
+    # -- captain ----------------------------------------------------------
+    def test_cannot_transfer_captain_out(self):
+        new_gk = self._outsider("GK", "NewGK")
+        with self.assertRaises(FantasyError) as ctx:
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[0],  # captain
+                player_in=new_gk,
+            )
+        self.assertIn("captain", str(ctx.exception).lower())
+
+    # -- player checks ----------------------------------------------------
+    def test_outgoing_not_in_squad_rejected(self):
+        outsider_out = self._outsider("MID", "NotMine")
+        outsider_in = self._outsider("MID", "In")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=outsider_out,
+                player_in=outsider_in,
+            )
+
+    def test_incoming_already_in_squad_rejected(self):
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=self.players[12],  # already in squad
+            )
+
+    def test_same_player_out_and_in_rejected(self):
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=self.players[11],
+            )
+
+    def test_incoming_without_price_rejected(self):
+        noprice = self._player(self.away, "MID", "NoPrice", price=None)
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=noprice,
+            )
+
+    # -- composition ------------------------------------------------------
+    def test_composition_breaks_rejected(self):
+        # Out MID, in ATT → composition becomes 5 MID / 3 ATT → 4 MID / 4 ATT
+        new_att = self._outsider("ATT", "NewATT")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],  # MID
+                player_in=new_att,
+            )
+
+    # -- budget -----------------------------------------------------------
+    def test_budget_exceeded_rejected(self):
+        self._set_team_budget(Decimal("80.0"))  # current squad = 75.0
+        expensive = self._outsider("MID", "Expensive", price=Decimal("20.0"))
+        # 14 × 5.0 + 20.0 = 90 > 80
+        with self.assertRaises(FantasyError) as ctx:
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=expensive,
+            )
+        self.assertIn("budget", str(ctx.exception).lower())
+
+    def test_transfer_within_budget_succeeds(self):
+        # default budget 100.0; both players 5.0 → fine
+        new_mid = self._outsider("MID", "Cheap", price=Decimal("4.5"))
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=new_mid,
+        )
+
+    # -- stage rules ------------------------------------------------------
+    def test_locked_gameweek_rejected(self):
+        Match.objects.create(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=self.stage,
+            kickoff_at=timezone.now() - timedelta(minutes=10),
+            status=Match.Status.LIVE,
+        )
+        new_mid = self._outsider("MID", "NewMID")
+        with self.assertRaises(FantasyError) as ctx:
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=new_mid,
+            )
+        self.assertIn("locked", str(ctx.exception).lower())
+
+    def test_round_stage_rejected(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-p3",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-p3"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        new_mid = self._outsider("MID", "NewMID")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=round_stage,
+                player_out=self.players[11],
+                player_in=new_mid,
+            )
+
+    def test_wrong_season_rejected(self):
+        other_season = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-p3"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        new_mid = self._outsider("MID", "NewMID")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=other_stage,
+                player_out=self.players[11],
+                player_in=new_mid,
+            )
+
+    def test_wrong_competition_rejected(self):
+        other_comp = Competition.objects.create(
+            organization=self.org, name="L2", slug="l2-p3",
+            type=Competition.Type.LEAGUE,
+        )
+        other_season = Season.objects.create(
+            competition=other_comp, name="2026", slug="2026-l2-p3"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        new_mid = self._outsider("MID", "NewMID")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=other_stage,
+                player_out=self.players[11],
+                player_in=new_mid,
+            )
+
+    # -- transfer limit ---------------------------------------------------
+    def test_first_transfer_allowed_second_rejected(self):
+        m1 = self._outsider("MID", "M1")
+        m2 = self._outsider("MID", "M2")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=m1,
+        )
+        with self.assertRaises(FantasyError) as ctx:
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=m1,
+                player_in=m2,
+            )
+        self.assertIn("limit", str(ctx.exception).lower())
+
+    def test_limit_scoped_per_gameweek(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        set_squad(
+            fantasy_team=self.team, stage=stage2, selections=self.valid
+        )
+        m1 = self._outsider("MID", "M1")
+        m2 = self._outsider("MID", "M2")
+
+        # Use up the limit in stage 1
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=m1,
+        )
+        self.assertEqual(transfers_remaining(fantasy_team=self.team, stage=self.stage), 0)
+        self.assertEqual(transfers_remaining(fantasy_team=self.team, stage=stage2), 1)
+
+        # stage 2 has its own allowance
+        make_transfer(
+            fantasy_team=self.team,
+            stage=stage2,
+            player_out=self.players[11],
+            player_in=m2,
+        )
+
+    # -- historical integrity --------------------------------------------
+    def test_historical_gameweek_unchanged(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        set_squad(
+            fantasy_team=self.team, stage=stage2, selections=self.valid
+        )
+        gw1_before = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+
+        new_mid = self._outsider("MID", "NewMID")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=stage2,
+            player_out=self.players[11],
+            player_in=new_mid,
+        )
+
+        gw1_after = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(gw1_before, gw1_after)
+        # Transfer record belongs to GW2
+        self.assertTrue(
+            FantasyTransfer.objects.filter(
+                fantasy_team=self.team, stage=stage2
+            ).exists()
+        )
+        self.assertFalse(
+            FantasyTransfer.objects.filter(
+                fantasy_team=self.team, stage=self.stage
+            ).exists()
+        )
+
+    # -- atomicity --------------------------------------------------------
+    def test_failed_transfer_leaves_squad_and_transfer_count_unchanged(self):
+        before_ids = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        before_transfers = FantasyTransfer.objects.count()
+
+        noprice = self._player(self.away, "MID", "NoPrice", price=None)
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=noprice,
+            )
+
+        after_ids = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(before_ids, after_ids)
+        self.assertEqual(FantasyTransfer.objects.count(), before_transfers)
+
+
+class TransferAPITests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        set_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        self.url = reverse("fantasy:team-transfers", args=[self.team.id])
+
+    def _outsider(self, position, name, price=Decimal("5.0")):
+        return self._player(self.away, position, name, price=price)
+
+    def test_owner_can_transfer(self):
+        new_mid = self._outsider("MID", "NewMID")
+        resp = self.client.post(
+            self.url,
+            {
+                "stage_id": self.stage.id,
+                "player_out_id": self.players[11].id,
+                "player_in_id": new_mid.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("transfer", resp.data)
+        self.assertIn("squad", resp.data)
+        self.assertEqual(resp.data["transfers_used"], 1)
+        self.assertEqual(resp.data["transfers_remaining"], 0)
+        # Squad payload includes the Phase 1/2/3 fields
+        for key in ("stage", "locked", "starters", "bench", "captain_id",
+                    "squad_value", "remaining_budget",
+                    "transfers_used", "transfers_remaining", "transfer_limit"):
+            self.assertIn(key, resp.data["squad"])
+
+    def test_anonymous_cannot_transfer(self):
+        anon = APIClient()
+        new_mid = self._outsider("MID", "NewMID")
+        resp = anon.post(
+            self.url,
+            {
+                "stage_id": self.stage.id,
+                "player_out_id": self.players[11].id,
+                "player_in_id": new_mid.id,
+            },
+            format="json",
+        )
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_other_user_cannot_transfer(self):
+        other = User.objects.create_user(
+            email="other-p3@example.com", password="StrongPass!23"
+        )
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+        new_mid = self._outsider("MID", "NewMID")
+        resp = other_client.post(
+            self.url,
+            {
+                "stage_id": self.stage.id,
+                "player_out_id": self.players[11].id,
+                "player_in_id": new_mid.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(FantasyTransfer.objects.count(), 0)
+
+    def test_missing_stage_id_rejected(self):
+        new_mid = self._outsider("MID", "NewMID")
+        resp = self.client.post(
+            self.url,
+            {
+                "player_out_id": self.players[11].id,
+                "player_in_id": new_mid.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_nonexistent_player_404(self):
+        resp = self.client.post(
+            self.url,
+            {
+                "stage_id": self.stage.id,
+                "player_out_id": 999999,
+                "player_in_id": 999998,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_composition_failure_returns_400(self):
+        new_att = self._outsider("ATT", "NewATT")
+        resp = self.client.post(
+            self.url,
+            {
+                "stage_id": self.stage.id,
+                "player_out_id": self.players[11].id,  # MID
+                "player_in_id": new_att.id,             # ATT
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)

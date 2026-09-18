@@ -8,3 +8,6 @@ MIN_PLAYER_PRICE = Decimal("4.0")
 MAX_PLAYER_PRICE = Decimal("20.0")
 
 ZERO = Decimal("0.0")
+# Number of free transfers allowed per gameweek.
+# Phase 3 MVP: fixed. Rollover / penalties / paid transfers are deferred.
+FREE_TRANSFER_LIMIT = 1

@@ -4,8 +4,9 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from league.models import Competition, Season, Stage
+from league.models import Competition, Player, Season, Stage
 
+from .constants import FREE_TRANSFER_LIMIT
 from .models import FantasyGroup, FantasyGroupMembership, FantasyTeam
 from .serializers import (
     FantasyGroupCreateSerializer,
@@ -16,6 +17,8 @@ from .serializers import (
     FantasyTeamWriteSerializer,
     LeaderboardRowSerializer,
     SquadWriteSerializer,
+    FantasyTransferSerializer,
+    TransferCreateSerializer,
 )
 from .services import (
     FantasyError,
@@ -31,6 +34,9 @@ from .services import (
     stage_leaderboard,
     is_gameweek_locked,
     validate_stage_for_fantasy,
+    make_transfer,
+    transfers_remaining,
+    transfers_used,
 )
 
 
@@ -70,6 +76,11 @@ def _serialize_squad(team, stage):
             if total_cost is not None
             else None
         ),
+        "transfers_used": transfers_used(fantasy_team=team, stage=stage),
+        "transfers_remaining": transfers_remaining(
+            fantasy_team=team, stage=stage
+        ),
+        "transfer_limit": FREE_TRANSFER_LIMIT,
     }
 
 
@@ -332,3 +343,43 @@ def group_leaderboard_view(request, pk):
         )
     )
     return Response({"group_id": group.id, "rows": _serialize_leaderboard(rows)})
+
+# ---------------------------------------------------------------------------
+# Transfers
+# ---------------------------------------------------------------------------
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def team_transfers_view(request, team_id):
+    team = _my_team_or_404(request, team_id)
+
+    serializer = TransferCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    stage = get_object_or_404(
+        Stage.objects.select_related("season"), pk=data["stage_id"]
+    )
+    player_out = get_object_or_404(Player, pk=data["player_out_id"])
+    player_in = get_object_or_404(Player, pk=data["player_in_id"])
+
+    try:
+        transfer = make_transfer(
+            fantasy_team=team,
+            stage=stage,
+            player_out=player_out,
+            player_in=player_in,
+        )
+    except FantasyError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(
+        {
+            "transfer": FantasyTransferSerializer(transfer).data,
+            "squad": _serialize_squad(team, stage),
+            "transfers_used": transfers_used(fantasy_team=team, stage=stage),
+            "transfers_remaining": transfers_remaining(
+                fantasy_team=team, stage=stage
+            ),
+        },
+        status=status.HTTP_201_CREATED,
+    )

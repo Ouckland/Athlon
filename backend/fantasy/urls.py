@@ -27,4 +27,9 @@ urlpatterns = [
         name="group-leaderboard",
     ),
     path("leaderboard/", views.global_leaderboard_view, name="global-leaderboard"),
+        path(
+        "teams/<int:team_id>/transfers/",
+        views.team_transfers_view,
+        name="team-transfers",
+    ),
 ]

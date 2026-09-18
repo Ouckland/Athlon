@@ -58,3 +58,25 @@ class FantasyPlayerPriceAdmin(admin.ModelAdmin):
     )
     autocomplete_fields = ("player",)
 
+from .models import FantasyTransfer  # extend import block
+
+@admin.register(FantasyTransfer)
+class FantasyTransferAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "fantasy_team",
+        "stage",
+        "player_out",
+        "player_in",
+        "created_at",
+    )
+    list_filter = ("stage",)
+    search_fields = (
+        "fantasy_team__name",
+        "player_out__first_name",
+        "player_out__last_name",
+        "player_in__first_name",
+        "player_in__last_name",
+    )
+    autocomplete_fields = ("fantasy_team", "player_out", "player_in")
+    readonly_fields = ("created_at",)
