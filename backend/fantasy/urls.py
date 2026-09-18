@@ -32,4 +32,9 @@ urlpatterns = [
         views.team_transfers_view,
         name="team-transfers",
     ),
+        path(
+        "teams/<int:team_id>/points/",
+        views.team_points_view,
+        name="team-points",
+    ),
 ]

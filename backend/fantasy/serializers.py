@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from league.models import Player
+from league.models import Player, Stage
 
 from .models import (
     FantasyGroup,
@@ -184,3 +184,32 @@ class TransferCreateSerializer(serializers.Serializer):
     stage_id = serializers.IntegerField()
     player_out_id = serializers.IntegerField()
     player_in_id = serializers.IntegerField()
+
+# ---------------------------------------------------------------------------
+# Gameweek points
+# ---------------------------------------------------------------------------
+class StageBriefSerializer(serializers.ModelSerializer):
+    kind_display = serializers.CharField(
+        source="get_kind_display", read_only=True
+    )
+
+    class Meta:
+        model = Stage
+        fields = ("id", "kind", "kind_display", "number", "name")
+
+
+class PlayerPointsRowSerializer(serializers.Serializer):
+    player = PlayerBriefSerializer()
+    is_starter = serializers.BooleanField()
+    is_captain = serializers.BooleanField()
+    base_points = serializers.IntegerField()
+    multiplier = serializers.IntegerField()
+    points = serializers.IntegerField()
+
+
+class GameweekPointsSerializer(serializers.Serializer):
+    stage = StageBriefSerializer()
+    total_points = serializers.IntegerField()
+    starting_xi_points = serializers.IntegerField()
+    bench_points = serializers.IntegerField()
+    players = PlayerPointsRowSerializer(many=True)

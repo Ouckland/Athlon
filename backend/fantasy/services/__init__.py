@@ -9,6 +9,7 @@ from .transfers import (
     transfers_remaining,
     transfers_used,
 )
+from .points import CAPTAIN_MULTIPLIER, get_gameweek_points
 
 from .leaderboard import (
     fantasy_team_total_points,
@@ -61,4 +62,6 @@ __all__ = [
         "make_transfer",
     "transfers_used",
     "transfers_remaining",
+        "get_gameweek_points",
+    "CAPTAIN_MULTIPLIER",
 ]
