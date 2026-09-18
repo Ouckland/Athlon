@@ -177,3 +177,41 @@ class LineupSubmitSerializer(serializers.Serializer):
     bench = serializers.ListField(
         child=serializers.IntegerField(), min_length=0, required=False, default=list
     )
+
+
+# ---------------------------------------------------------------------------
+# Public (fixtures / livescore) — read-only
+# ---------------------------------------------------------------------------
+class PublicTeamSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Team
+        fields = ("id", "name", "short_name", "logo")
+
+
+class PublicCompetitionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Competition
+        fields = ("id", "name", "type")
+
+
+class PublicMatchSerializer(serializers.ModelSerializer):
+    competition = PublicCompetitionSerializer(read_only=True)
+    stage = StageBriefSerializer(read_only=True)
+    home_team = PublicTeamSerializer(read_only=True)
+    away_team = PublicTeamSerializer(read_only=True)
+
+    class Meta:
+        model = Match
+        fields = (
+            "id",
+            "competition",
+            "stage",
+            "home_team",
+            "away_team",
+            "kickoff_at",
+            "status",
+            "minute",
+            "home_score",
+            "away_score",
+        )
+        read_only_fields = fields

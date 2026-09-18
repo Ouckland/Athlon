@@ -327,10 +327,16 @@ class EligibilityTests(FantasyTestBase):
 # ---------------------------------------------------------------------------
 class ScoringTestBase(FantasyTestBase):
     """
-    Scoring in Stage 2 derives minutes from MatchLineup. Tests create lineup
-    rows directly to control minutes precisely without going through
-    record_match_event.
+    Scoring is derived from submitted lineups. Tests build lineup rows
+    directly so minutes are deterministic and independent of the lineup
+    service's SCHEDULED-only rule.
     """
+
+    # Starting XI indices deliberately include one ATT so the goal-by-ATT
+    # test has a starter attacker. Layout of POSITIONS_15:
+    #   0-1 GK, 2-6 DEF, 7-11 MID, 12-14 ATT.
+    STARTER_IX = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12]  # 2 GK, 5 DEF, 3 MID, 1 ATT
+    BENCH_IX = [10, 11, 13, 14]                       # 2 MID, 2 ATT
 
     def setUp(self):
         super().setUp()
@@ -342,54 +348,46 @@ class ScoringTestBase(FantasyTestBase):
             self._player(self.away, pos, f"A{i}")
             for i, pos in enumerate(POSITIONS_15)
         ]
-        # 11 starters on each side, all played 90
-        for p in self.home_players[:11]:
+
+        for i in self.STARTER_IX:
             MatchLineup.objects.create(
-                match=self.match, team=self.home, player=p,
+                match=self.match, team=self.home, player=self.home_players[i],
                 is_starter=True, subbed_off_minute=90,
             )
-        for p in self.away_players[:11]:
             MatchLineup.objects.create(
-                match=self.match, team=self.away, player=p,
+                match=self.match, team=self.away, player=self.away_players[i],
                 is_starter=True, subbed_off_minute=90,
             )
-        # Bench rows (0 minutes)
-        for i, p in enumerate(self.home_players[11:15]):
+
+        for order, i in enumerate(self.BENCH_IX):
             MatchLineup.objects.create(
-                match=self.match, team=self.home, player=p,
-                is_starter=False, bench_order=i,
+                match=self.match, team=self.home, player=self.home_players[i],
+                is_starter=False, bench_order=order,
             )
-        for i, p in enumerate(self.away_players[11:15]):
             MatchLineup.objects.create(
-                match=self.match, team=self.away, player=p,
-                is_starter=False, bench_order=i,
+                match=self.match, team=self.away, player=self.away_players[i],
+                is_starter=False, bench_order=order,
             )
+
         Match.objects.filter(pk=self.match.pk).update(
-            minute=90, status=Match.Status.LIVE
+            minute=90, status=Match.Status.LIVE,
         )
         self.match.refresh_from_db()
 
+    # helpers (unchanged)
     def _goal(self, player, team, minute=10, assister=None):
         return MatchEvent.objects.create(
-            match=self.match,
-            type=MatchEvent.Type.GOAL,
-            minute=minute,
-            team=team,
-            player=player,
-            related_player=assister,
+            match=self.match, type=MatchEvent.Type.GOAL, minute=minute,
+            team=team, player=player, related_player=assister,
         )
 
     def _card(self, player, team, card_type, minute=20):
         return MatchEvent.objects.create(
-            match=self.match,
-            type=card_type,
-            minute=minute,
-            team=team,
-            player=player,
+            match=self.match, type=card_type, minute=minute,
+            team=team, player=player,
         )
 
     def _set_minutes(self, player, minutes):
-        """Directly set the s/o minute so the player is treated as having played N minutes."""
         MatchLineup.objects.filter(match=self.match, player=player).update(
             subbed_off_minute=minutes
         )
@@ -409,20 +407,27 @@ class ScoringTests(ScoringTestBase):
         self.assertEqual(points, 0)
 
     def test_starter_with_no_events_gets_appearance_and_60plus(self):
-        p = self.home_players[0]
+        # MID starter — avoids the GK/DEF clean-sheet bonus.
+        p = self.home_players[7]
         points, breakdown = score_player_for_match(p, self.match)
         self.assertEqual(breakdown["appearance"], 1)
         self.assertIn("minutes_60_plus", breakdown)
         self.assertEqual(points, 2)
 
-    # -- appearance -------------------------------------------------------
     def test_appearance_awarded_with_any_event(self):
-        p = self.home_players[0]
+        p = self.home_players[7]  # MID starter
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=30)
         points, breakdown = score_player_for_match(p, self.match)
         self.assertEqual(breakdown["appearance"], 1)
         # appearance 1 + yellow -1 + 60+ 1 = 1
         self.assertEqual(points, 1)
+
+    def test_calculate_match_points_creates_rows_for_all_starters(self):
+        # All lineup participants get a FantasyPoints row — starters and
+        # bench. Bench entries stay at 0 points but the row exists.
+        # 15 lineup rows per team × 2 teams = 30.
+        written = calculate_match_points(self.match)
+        self.assertEqual(len(written), 30)
 
     # -- goals by position ------------------------------------------------
     def test_goal_by_gk(self):
@@ -581,12 +586,7 @@ class ScoringTests(ScoringTestBase):
         _, breakdown = score_player_for_match(bench, self.match)
         self.assertIn("minutes_60_plus", breakdown)
 
-    # -- persistence ------------------------------------------------------
-    def test_calculate_match_points_creates_rows_for_all_starters(self):
-        # 22 starters across both sides
-        written = calculate_match_points(self.match)
-        self.assertEqual(len(written), 22)
-
+   
     def test_calculate_match_points_scopes_to_lineup_plus_events(self):
         # Add an unrelated player with a goal — should be included
         outsider = self._player(self.home, "ATT", "Unrelated")
@@ -628,7 +628,7 @@ class ScoringTests(ScoringTestBase):
 # ---------------------------------------------------------------------------
 class LineupDrivenScoringTests(FantasyTestBase):
     def test_calculate_match_points_includes_lineup_participants(self):
-        # Create 11 home starters and submit
+        # 11 starters + 4 bench = 15 rows per submitted lineup.
         home_players = [
             self._player(self.home, pos, f"H{i}")
             for i, pos in enumerate(POSITIONS_15)
@@ -643,13 +643,13 @@ class LineupDrivenScoringTests(FantasyTestBase):
         self.match.refresh_from_db()
 
         calculate_match_points(self.match)
-        # All 11 starters should have points even without events
         self.assertEqual(
-            FantasyPoints.objects.filter(match=self.match).count(), 11
+            FantasyPoints.objects.filter(match=self.match).count(), 15
         )
+        # Every starter scored at least appearance + 60+.
         for p in home_players[:11]:
             fp = FantasyPoints.objects.get(match=self.match, player=p)
-            self.assertGreaterEqual(fp.points, 2)  # appearance + 60+
+            self.assertGreaterEqual(fp.points, 2)
 
 
 # ---------------------------------------------------------------------------
