@@ -175,22 +175,40 @@ def is_gameweek_locked(stage):
 # ---------------------------------------------------------------------------
 # Squad
 # ---------------------------------------------------------------------------
-def set_squad(*, fantasy_team, stage, selections):
+def create_starting_squad(*, fantasy_team, stage, selections):
     """
-    Replace the fantasy team's squad for a given gameweek.
+    Create the initial squad for a fantasy team and gameweek.
 
-    `selections` is a list of dicts:
-        {"player_id": int, "is_starter": bool, "is_captain": bool}
+    Can only be called once per (fantasy_team, stage).
+
+    Rules:
+      - stage must be a valid GAMEWEEK for the fantasy team
+      - gameweek must not be locked
+      - no squad may already exist for this (fantasy_team, stage)
+      - the squad must pass all composition / budget / captain / eligibility
+        rules in _validate_squad()
+
+    Does NOT consume a transfer. Does NOT delete or replace an existing
+    squad — the previous incarnation of this function did, and that path
+    has been removed.
     """
     validate_stage_for_fantasy(fantasy_team=fantasy_team, stage=stage)
     if is_gameweek_locked(stage):
         raise FantasyError(
-            "This gameweek is locked; the squad can no longer be changed."
+            "This gameweek is locked; the starting squad can no longer be created."
         )
+
+    if FantasyPlayerSelection.objects.filter(
+        fantasy_team=fantasy_team, stage=stage
+    ).exists():
+        raise FantasyError(
+            "A starting squad already exists for this gameweek. "
+            "Use a transfer to change players."
+        )
+
     _validate_squad(fantasy_team, selections)
 
     with transaction.atomic():
-        fantasy_team.selections.filter(stage=stage).delete()
         FantasyPlayerSelection.objects.bulk_create(
             [
                 FantasyPlayerSelection(

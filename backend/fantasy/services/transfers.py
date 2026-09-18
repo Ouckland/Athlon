@@ -68,6 +68,12 @@ def make_transfer(*, fantasy_team, stage, player_out, player_in):
                 fantasy_team=fantasy_team, stage=stage
             )
         )
+        
+        if not current:
+            raise FantasyError(
+                "No starting squad exists for this gameweek. "
+                "Create a starting squad first."
+            )
         by_player_id = {s.player_id: s for s in current}
 
         out_selection = by_player_id.get(player_out.id)

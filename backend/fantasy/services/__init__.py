@@ -37,7 +37,7 @@ from .teams import (
     get_player_price,
     is_gameweek_locked,
     set_player_price,
-    set_squad,
+    create_starting_squad,
     squad_total_cost,
     validate_player_eligibility,
     validate_stage_for_fantasy,
@@ -47,7 +47,7 @@ from .teams import (
 __all__ = [
     # teams
     "FantasyError", "SQUAD_SIZE", "STARTERS", "BENCH", "POSITION_REQUIREMENTS",
-    "create_fantasy_team", "set_squad", "validate_player_eligibility",
+    "create_fantasy_team", "create_starting_squad", "validate_player_eligibility",
     # scoring
     "SCORING_RULES", "CAPTAIN_MULTIPLIER", "CLEAN_SHEET_MIN_MINUTES",
     "score_player_for_match", "calculate_match_points", "recalculate_match_points",
