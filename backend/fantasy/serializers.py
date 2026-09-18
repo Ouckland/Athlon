@@ -106,29 +106,29 @@ class FantasyGroupMemberSerializer(serializers.ModelSerializer):
     def get_display_name(self, obj):
         return obj.user.display_name or obj.user.get_full_name() or f"User #{obj.user_id}"
 
-
 class FantasyGroupSerializer(serializers.ModelSerializer):
-    owner_email = serializers.EmailField(source="owner.email", read_only=True)
-    member_count = serializers.SerializerMethodField()
-    members = serializers.SerializerMethodField()
     owner_id = serializers.IntegerField(source="owner.id", read_only=True)
     owner_display_name = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
+    members = serializers.SerializerMethodField()
+
     class Meta:
         model = FantasyGroup
         fields = (
             "id",
             "name",
             "invite_code",
-            "owner_email",
+            "owner_id",
+            "owner_display_name",
             "member_count",
             "members",
             "created_at",
             "updated_at",
         )
 
-
     def get_owner_display_name(self, obj):
-        return obj.owner.display_name or obj.owner.get_full_name() or f"User #{obj.owner_id}"
+        u = obj.owner
+        return u.display_name or u.get_full_name() or f"User #{u.id}"
 
     def get_member_count(self, obj):
         return obj.memberships.count()
@@ -156,3 +156,4 @@ class LeaderboardRowSerializer(serializers.Serializer):
     owner_id = serializers.IntegerField()
     owner_display_name = serializers.CharField()
     total_points = serializers.IntegerField()
+

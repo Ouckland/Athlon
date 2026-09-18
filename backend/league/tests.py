@@ -1047,3 +1047,83 @@ class TeamManagerAPITests(TestCase):
         self.client.force_authenticate(user=self.admin)
         resp = self.client.delete(self._detail_url(999999))
         self.assertEqual(resp.status_code, 404)
+
+class CompetitionTypeCreationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="ctc@example.com", password="StrongPass!23"
+        )
+        self.org = Organization.objects.create(name="Org CTC", slug="org-ctc")
+        self.url = reverse("league:competition-list")
+
+    def test_default_type_is_league(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.url,
+            {"organization_id": self.org.id, "name": "Default League"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["type"], "LEAGUE")
+        comp = Competition.objects.get(id=resp.data["id"])
+        self.assertEqual(comp.type, Competition.Type.LEAGUE)
+
+    def test_explicit_league_type(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.url,
+            {
+                "organization_id": self.org.id,
+                "name": "Explicit League",
+                "type": "LEAGUE",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["type"], "LEAGUE")
+
+    def test_cup_type_is_honored(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.url,
+            {
+                "organization_id": self.org.id,
+                "name": "FA Cup",
+                "type": "CUP",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["type"], "CUP")
+        comp = Competition.objects.get(id=resp.data["id"])
+        self.assertEqual(comp.type, Competition.Type.CUP)
+
+    def test_invalid_type_rejected(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self.url,
+            {
+                "organization_id": self.org.id,
+                "name": "Bad Type",
+                "type": "TOURNAMENT",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cup_accepts_round_stage(self):
+        self.client.force_authenticate(user=self.user)
+        comp = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-ctc",
+            type=Competition.Type.CUP,
+        )
+        season = Season.objects.create(
+            competition=comp, name="2026", slug="2026-ctc"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[season.id]),
+            {"kind": "ROUND", "number": 1},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
