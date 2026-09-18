@@ -15,7 +15,9 @@ from .models import (
     FantasyPlayerSelection,
     FantasyPoints,
     FantasyTeam,
+    FantasyPlayerPrice,
 )
+from .constants import DEFAULT_STARTING_BUDGET, MAX_PLAYER_PRICE
 from .services import (
     BENCH,
     CAPTAIN_MULTIPLIER,
@@ -39,11 +41,20 @@ from .services import (
     set_squad,
     stage_leaderboard,
     validate_player_eligibility,
+    get_player_price,
+    set_player_price,
+    squad_total_cost,
 )
 
 User = get_user_model()
 
 POSITIONS_15 = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
+
+
+from decimal import Decimal
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +91,17 @@ class FantasyTestBase(TestCase):
         )
 
     # -- helpers ---------------------------------------------------------
-    def _player(self, team, position, name="P", shirt=None):
-        return Player.objects.create(
-            team=team, first_name=name, position=position, shirt_number=shirt,
+    def _player(self, team, position, name="P", shirt=None, price=Decimal("5.0")):
+        player = Player.objects.create(
+            team=team,
+            first_name=name,
+            position=position,
+            shirt_number=shirt,
         )
+        if price is not None:
+            FantasyPlayerPrice.objects.create(player=player, price=price)
+        return player
+
 
     def _make_valid_squad(self, team=None):
         team = team or self.home
@@ -1461,3 +1479,102 @@ class FantasyGroupOwnerPrivacyTests(TestCase):
             self.assertNotIn("email", m)
             self.assertIn("user_id", m)
             self.assertIn("display_name", m)
+
+class FantasyEconomyTests(FantasyTestBase):
+    # -- player prices ----------------------------------------------------
+    def test_set_player_price_creates_row(self):
+        p = self._player(self.home, "MID", "M", price=None)
+        self.assertIsNone(get_player_price(p))
+        obj = set_player_price(player=p, price=Decimal("7.5"))
+        self.assertEqual(obj.price, Decimal("7.5"))
+        self.assertEqual(get_player_price(p), Decimal("7.5"))
+
+    def test_set_player_price_updates_existing(self):
+        p = self._player(self.home, "MID", "M", price=Decimal("5.0"))
+        set_player_price(player=p, price=Decimal("8.0"))
+        p.refresh_from_db()
+        self.assertEqual(get_player_price(p), Decimal("8.0"))
+        self.assertEqual(FantasyPlayerPrice.objects.filter(player=p).count(), 1)
+
+    def test_price_below_minimum_rejected(self):
+        p = self._player(self.home, "MID", "M", price=None)
+        with self.assertRaises(FantasyError):
+            set_player_price(player=p, price=Decimal("1.0"))
+
+    def test_price_above_maximum_rejected(self):
+        p = self._player(self.home, "MID", "M", price=None)
+        with self.assertRaises(FantasyError):
+            set_player_price(player=p, price=MAX_PLAYER_PRICE + Decimal("0.1"))
+
+    def test_price_none_rejected(self):
+        p = self._player(self.home, "MID", "M", price=None)
+        with self.assertRaises(FantasyError):
+            set_player_price(player=p, price=None)
+
+    # -- team budget ------------------------------------------------------
+    def test_new_team_has_default_budget(self):
+        team = self._make_team(name="T")
+        self.assertEqual(team.starting_budget, DEFAULT_STARTING_BUDGET)
+
+    # -- squad affordability ---------------------------------------------
+    def test_squad_within_budget_accepted(self):
+        team = self._make_team(name="T")
+        _, selections = self._make_valid_squad()
+        # default _player price 5.0 → 15 × 5.0 = 75.0
+        set_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        self.assertEqual(team.selections.filter(stage=self.stage).count(), 15)
+
+    def test_squad_over_budget_rejected(self):
+        team = self._make_team(name="T")
+        players = []
+        for pos, count in [("GK", 2), ("DEF", 5), ("MID", 5), ("ATT", 3)]:
+            players += [
+                self._player(self.home, pos, f"{pos}{i}", price=Decimal("7.0"))
+                for i in range(count)
+            ]
+        # 15 × 7.0 = 105.0 > 100.0
+        selections = [
+            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+            for i, p in enumerate(players)
+        ]
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        self.assertIn("exceeds budget", str(ctx.exception))
+        self.assertEqual(team.selections.count(), 0)
+
+    def test_squad_at_exact_budget_accepted(self):
+        team = self._make_team(name="T")
+        # 2 GK @ 5.0 + 5 DEF @ 6.0 + 5 MID @ 7.0 + 3 ATT @ 10.0
+        # = 10 + 30 + 35 + 30 = 105 → still over.
+        # Use a mix that sums exactly to 100:
+        # 2 GK @ 4.0 (8) + 5 DEF @ 6.0 (30) + 5 MID @ 7.0 (35) + 3 ATT @ 9.0 (27) = 100.0
+        players = []
+        players += [self._player(self.home, "GK", f"GK{i}", price=Decimal("4.0")) for i in range(2)]
+        players += [self._player(self.home, "DEF", f"DEF{i}", price=Decimal("6.0")) for i in range(5)]
+        players += [self._player(self.home, "MID", f"MID{i}", price=Decimal("7.0")) for i in range(5)]
+        players += [self._player(self.home, "ATT", f"ATT{i}", price=Decimal("9.0")) for i in range(3)]
+        selections = [
+            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+            for i, p in enumerate(players)
+        ]
+        set_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        self.assertEqual(team.selections.filter(stage=self.stage).count(), 15)
+
+    def test_player_without_price_rejected(self):
+        team = self._make_team(name="T")
+        _, selections = self._make_valid_squad()
+        # Wipe a player's price row.
+        FantasyPlayerPrice.objects.filter(
+            player_id=selections[0]["player_id"]
+        ).delete()
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        self.assertIn("no fantasy price", str(ctx.exception))
+
+    def test_squad_total_cost_helper(self):
+        team = self._make_team(name="T")
+        _, selections = self._make_valid_squad()
+        set_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        rows = list(team.selections.filter(stage=self.stage))
+        total = squad_total_cost(rows)
+        self.assertEqual(total, Decimal("75.0"))

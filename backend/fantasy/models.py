@@ -1,14 +1,10 @@
 from django.conf import settings
 from django.db import models
 
+from .constants import DEFAULT_STARTING_BUDGET
+
 
 class FantasyTeam(models.Model):
-    """
-    A user's fantasy participation in one (competition, season).
-
-    A user may have many fantasy teams — one per competition/season pair.
-    """
-
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -25,6 +21,9 @@ class FantasyTeam(models.Model):
         related_name="fantasy_teams",
     )
     name = models.CharField(max_length=100)
+    starting_budget = models.DecimalField(
+        max_digits=6, decimal_places=1, default=DEFAULT_STARTING_BUDGET
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -39,6 +38,7 @@ class FantasyTeam(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.user.email} · {self.competition.name} {self.season.name})"
+
 
 class FantasyPlayerSelection(models.Model):
     fantasy_team = models.ForeignKey(
@@ -154,3 +154,28 @@ class FantasyPoints(models.Model):
 
     def __str__(self):
         return f"{self.player} @ {self.match}: {self.points} pts"
+
+
+
+class FantasyPlayerPrice(models.Model):
+    """
+    A player's fantasy price. One price per player globally.
+
+    If the player has no row here, they are not selectable in a fantasy
+    squad — set_squad() rejects selections containing un-priced players.
+    """
+
+    player = models.OneToOneField(
+        "league.Player",
+        on_delete=models.CASCADE,
+        related_name="fantasy_price",
+    )
+    price = models.DecimalField(max_digits=5, decimal_places=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-price"]
+
+    def __str__(self):
+        return f"{self.player} = {self.price}"

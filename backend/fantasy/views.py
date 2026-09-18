@@ -38,16 +38,28 @@ from .services import (
 def _serialize_squad(team, stage):
     selections = list(
         team.selections.filter(stage=stage)
-        .select_related("player", "player__team")
-        .all()
+        .select_related("player", "player__team", "player__fantasy_price")
     )
     starters = [s for s in selections if s.is_starter]
     bench = [s for s in selections if not s.is_starter]
     captain = next((s for s in selections if s.is_captain), None)
+
+    from .services import squad_total_cost
+    try:
+        total_cost = squad_total_cost(selections)
+    except Exception:
+        total_cost = None
+
     return {
         "starters": FantasyPlayerSelectionSerializer(starters, many=True).data,
         "bench": FantasyPlayerSelectionSerializer(bench, many=True).data,
         "captain_id": captain.player_id if captain else None,
+        "squad_value": str(total_cost) if total_cost is not None else None,
+        "remaining_budget": (
+            str(team.starting_budget - total_cost)
+            if total_cost is not None
+            else None
+        ),
     }
 
 
