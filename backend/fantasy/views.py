@@ -29,6 +29,8 @@ from .services import (
     season_leaderboard,
     set_squad,
     stage_leaderboard,
+    is_gameweek_locked,
+    validate_stage_for_fantasy,
 )
 
 
@@ -51,6 +53,14 @@ def _serialize_squad(team, stage):
         total_cost = None
 
     return {
+        "stage": {
+            "id": stage.id,
+            "kind": stage.kind,
+            "kind_display": stage.get_kind_display(),
+            "number": stage.number,
+            "name": stage.name,
+        },
+        "locked": is_gameweek_locked(stage),
         "starters": FantasyPlayerSelectionSerializer(starters, many=True).data,
         "bench": FantasyPlayerSelectionSerializer(bench, many=True).data,
         "captain_id": captain.player_id if captain else None,
@@ -164,11 +174,11 @@ def team_squad_view(request, team_id, stage_id):
     team = _my_team_or_404(request, team_id)
     stage = get_object_or_404(Stage.objects.select_related("season"), pk=stage_id)
 
-    if stage.season_id != team.season_id:
-        return Response(
-            {"detail": "Stage is not in this fantasy team's season."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+    # Stage validation applies to both reads and writes.
+    try:
+        validate_stage_for_fantasy(fantasy_team=team, stage=stage)
+    except FantasyError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
     if request.method == "GET":
         return Response(_serialize_squad(team, stage))
