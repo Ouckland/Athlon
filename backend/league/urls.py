@@ -35,4 +35,14 @@ urlpatterns = [
         views.competition_team_detail_view,
         name="competition-team-detail",
     ),
+        path(
+        "teams/<int:team_id>/managers/",
+        views.team_managers_view,
+        name="team-managers",
+    ),
+    path(
+        "teams/<int:team_id>/managers/<int:user_id>/",
+        views.team_manager_detail_view,
+        name="team-manager-detail",
+    ),
 ]

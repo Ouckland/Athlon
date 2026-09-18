@@ -4,9 +4,8 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from .models import Competition, Organization, Player, Team, Season, Stage
-from .services import LeagueError, set_team_captain, set_team_competitions
-
+from .models import Competition, Organization, Player, Team, Season, Stage, TeamManager
+from .services import LeagueError, set_team_captain, set_team_competitions, TeamManagerError,add_team_manager,can_manage_team,is_team_manager,remove_team_manager
 User = get_user_model()
 
 
@@ -764,3 +763,287 @@ class CompetitionParticipationTests(TestCase):
         self.assertFalse(
             other_comp.teams.filter(id=self.home.id).exists()
         )
+
+# ---------------------------------------------------------------------------
+# Team managers — service layer
+# ---------------------------------------------------------------------------
+class TeamManagerServiceTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org TM", slug="org-tm")
+        self.team_a = Team.objects.create(
+            organization=self.org, name="A", slug="a-tm"
+        )
+        self.team_b = Team.objects.create(
+            organization=self.org, name="B", slug="b-tm"
+        )
+        self.admin = User.objects.create_user(
+            email="admin-tm@example.com",
+            password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+        self.scout = User.objects.create_user(
+            email="scout-tm@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.user = User.objects.create_user(
+            email="user-tm@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
+        )
+
+    # -- is_team_manager --------------------------------------------------
+    def test_assigned_user_is_recognized_as_manager(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        self.assertTrue(is_team_manager(self.user, self.team_a))
+
+    def test_unassigned_user_is_not_manager(self):
+        self.assertFalse(is_team_manager(self.user, self.team_a))
+
+    def test_manager_of_a_is_not_manager_of_b(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        self.assertTrue(is_team_manager(self.user, self.team_a))
+        self.assertFalse(is_team_manager(self.user, self.team_b))
+
+    def test_scout_is_not_automatically_a_manager(self):
+        self.assertFalse(is_team_manager(self.scout, self.team_a))
+
+    def test_admin_role_alone_is_not_team_manager(self):
+        # Admin has override via can_manage_team, but is not a row-level manager.
+        self.assertFalse(is_team_manager(self.admin, self.team_a))
+
+    # -- can_manage_team --------------------------------------------------
+    def test_assigned_manager_can_manage_their_team(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        self.assertTrue(can_manage_team(self.user, self.team_a))
+
+    def test_unassigned_user_cannot_manage(self):
+        self.assertFalse(can_manage_team(self.user, self.team_a))
+
+    def test_manager_of_a_cannot_manage_b(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        self.assertFalse(can_manage_team(self.user, self.team_b))
+
+    def test_scout_cannot_manage_without_assignment(self):
+        self.assertFalse(can_manage_team(self.scout, self.team_a))
+
+    def test_admin_has_override(self):
+        self.assertTrue(can_manage_team(self.admin, self.team_a))
+        self.assertTrue(can_manage_team(self.admin, self.team_b))
+
+    def test_superuser_has_override(self):
+        root = User.objects.create_user(
+            email="root-tm@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        root.is_superuser = True
+        root.save(update_fields=["is_superuser"])
+        self.assertTrue(can_manage_team(root, self.team_a))
+
+    # -- idempotency / errors --------------------------------------------
+    def test_add_is_idempotent(self):
+        m1 = add_team_manager(team=self.team_a, user=self.user)
+        m2 = add_team_manager(team=self.team_a, user=self.user)
+        self.assertEqual(m1.id, m2.id)
+        self.assertEqual(
+            TeamManager.objects.filter(team=self.team_a, user=self.user).count(),
+            1,
+        )
+
+    def test_remove_nonexistent_raises(self):
+        with self.assertRaises(TeamManagerError):
+            remove_team_manager(team=self.team_a, user=self.user)
+
+    def test_remove_revokes_authorization(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        self.assertTrue(can_manage_team(self.user, self.team_a))
+        remove_team_manager(team=self.team_a, user=self.user)
+        self.assertFalse(can_manage_team(self.user, self.team_a))
+
+    # -- multiple teams --------------------------------------------------
+    def test_user_can_manage_multiple_teams(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        add_team_manager(team=self.team_b, user=self.user)
+        self.assertTrue(can_manage_team(self.user, self.team_a))
+        self.assertTrue(can_manage_team(self.user, self.team_b))
+
+    def test_team_can_have_multiple_managers(self):
+        add_team_manager(team=self.team_a, user=self.user)
+        add_team_manager(team=self.team_a, user=self.scout)
+        self.assertEqual(
+            TeamManager.objects.filter(team=self.team_a).count(), 2
+        )
+
+
+# ---------------------------------------------------------------------------
+# Team managers — API
+# ---------------------------------------------------------------------------
+class TeamManagerAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.org = Organization.objects.create(name="Org TMA", slug="org-tma")
+        self.team = Team.objects.create(
+            organization=self.org, name="Team", slug="team-tma"
+        )
+        self.other_team = Team.objects.create(
+            organization=self.org, name="Other", slug="other-tma"
+        )
+        self.admin = User.objects.create_user(
+            email="admin-tma@example.com",
+            password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+        self.scout = User.objects.create_user(
+            email="scout-tma@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.user = User.objects.create_user(
+            email="user-tma@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
+        )
+
+    def _list_url(self, team_id=None):
+        return reverse(
+            "league:team-managers", args=[team_id or self.team.id]
+        )
+
+    def _detail_url(self, user_id, team_id=None):
+        return reverse(
+            "league:team-manager-detail",
+            args=[team_id or self.team.id, user_id],
+        )
+
+    # -- list ------------------------------------------------------------
+    def test_list_is_public(self):
+        add_team_manager(team=self.team, user=self.user)
+        resp = self.client.get(self._list_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+        self.assertEqual(resp.data[0]["user_id"], self.user.id)
+        self.assertNotIn("email", resp.data[0])
+
+    def test_list_unknown_team_404(self):
+        resp = self.client.get(reverse("league:team-managers", args=[999999]))
+        self.assertEqual(resp.status_code, 404)
+
+    # -- assign ----------------------------------------------------------
+    def test_admin_can_assign_manager(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"user_id": self.user.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["user_id"], self.user.id)
+        self.assertTrue(
+            TeamManager.objects.filter(team=self.team, user=self.user).exists()
+        )
+
+    def test_admin_assign_is_idempotent(self):
+        self.client.force_authenticate(user=self.admin)
+        self.client.post(
+            self._list_url(), {"user_id": self.user.id}, format="json"
+        )
+        resp = self.client.post(
+            self._list_url(), {"user_id": self.user.id}, format="json"
+        )
+        self.assertIn(resp.status_code, (200, 201))
+        self.assertEqual(
+            TeamManager.objects.filter(team=self.team, user=self.user).count(),
+            1,
+        )
+
+    def test_anonymous_cannot_assign(self):
+        resp = self.client.post(
+            self._list_url(), {"user_id": self.user.id}, format="json"
+        )
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertFalse(
+            TeamManager.objects.filter(team=self.team).exists()
+        )
+
+    def test_normal_user_cannot_assign_self(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._list_url(), {"user_id": self.user.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(
+            TeamManager.objects.filter(team=self.team).exists()
+        )
+
+    def test_scout_cannot_assign_self(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.post(
+            self._list_url(), {"user_id": self.scout.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(
+            TeamManager.objects.filter(team=self.team).exists()
+        )
+
+    def test_assign_to_unknown_user_rejected(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"user_id": 999999}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_assign_without_user_id_rejected(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(self._list_url(), {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_assign_on_unknown_team_404(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            reverse("league:team-managers", args=[999999]),
+            {"user_id": self.user.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # -- remove ----------------------------------------------------------
+    def test_admin_can_remove_manager(self):
+        add_team_manager(team=self.team, user=self.user)
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url(self.user.id))
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(
+            TeamManager.objects.filter(team=self.team, user=self.user).exists()
+        )
+
+    def test_anonymous_cannot_remove(self):
+        add_team_manager(team=self.team, user=self.user)
+        resp = self.client.delete(self._detail_url(self.user.id))
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(
+            TeamManager.objects.filter(team=self.team, user=self.user).exists()
+        )
+
+    def test_normal_user_cannot_remove(self):
+        add_team_manager(team=self.team, user=self.user)
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.delete(self._detail_url(self.user.id))
+        self.assertEqual(resp.status_code, 403)
+        self.assertTrue(
+            TeamManager.objects.filter(team=self.team, user=self.user).exists()
+        )
+
+    def test_scout_cannot_remove(self):
+        add_team_manager(team=self.team, user=self.user)
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.delete(self._detail_url(self.user.id))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_removing_non_manager_400(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url(self.user.id))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_remove_unknown_user_404(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url(999999))
+        self.assertEqual(resp.status_code, 404)
