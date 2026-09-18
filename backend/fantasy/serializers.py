@@ -166,3 +166,21 @@ class LeaderboardRowSerializer(serializers.Serializer):
     owner_display_name = serializers.CharField()
     total_points = serializers.IntegerField()
 
+
+from .models import FantasyTransfer  # extend the existing import block
+
+
+class FantasyTransferSerializer(serializers.ModelSerializer):
+    stage_id = serializers.IntegerField(source="stage.id", read_only=True)
+    player_out = PlayerBriefSerializer(read_only=True)
+    player_in = PlayerBriefSerializer(read_only=True)
+
+    class Meta:
+        model = FantasyTransfer
+        fields = ("id", "stage_id", "player_out", "player_in", "created_at")
+
+
+class TransferCreateSerializer(serializers.Serializer):
+    stage_id = serializers.IntegerField()
+    player_out_id = serializers.IntegerField()
+    player_in_id = serializers.IntegerField()

@@ -179,3 +179,50 @@ class FantasyPlayerPrice(models.Model):
 
     def __str__(self):
         return f"{self.player} = {self.price}"
+
+
+class FantasyTransfer(models.Model):
+    """
+    An audit record of one transfer made by a fantasy team in a gameweek.
+
+    - player_out must have been in the squad before the transfer
+    - player_in takes the same slot (starter/bench) as player_out
+    - player_out cannot be the captain (captain must be changed first)
+    """
+
+    fantasy_team = models.ForeignKey(
+        FantasyTeam,
+        on_delete=models.CASCADE,
+        related_name="transfers",
+    )
+    stage = models.ForeignKey(
+        "league.Stage",
+        on_delete=models.CASCADE,
+        related_name="fantasy_transfers",
+    )
+    player_out = models.ForeignKey(
+        "league.Player",
+        on_delete=models.PROTECT,
+        related_name="fantasy_transfers_out",
+    )
+    player_in = models.ForeignKey(
+        "league.Player",
+        on_delete=models.PROTECT,
+        related_name="fantasy_transfers_in",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["fantasy_team", "stage"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(player_out=models.F("player_in")),
+                name="fantasy_transfer_out_differs_from_in",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.player_out} → {self.player_in} ({self.fantasy_team.name}, GW{self.stage.number})"

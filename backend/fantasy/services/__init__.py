@@ -4,6 +4,12 @@ from .groups import (
     leave_group,
     remove_group_member,
 )
+from .transfers import (
+    make_transfer,
+    transfers_remaining,
+    transfers_used,
+)
+
 from .leaderboard import (
     fantasy_team_total_points,
     group_season_leaderboard,
@@ -52,4 +58,7 @@ __all__ = [
     # Teams
     "set_player_price","get_player_price","squad_total_cost",
     "is_gameweek_locked","validate_stage_for_fantasy",
+        "make_transfer",
+    "transfers_used",
+    "transfers_remaining",
 ]
