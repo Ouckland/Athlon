@@ -1,3 +1,4 @@
+from datetime import timedelta
 from django.db import IntegrityError, transaction
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -1036,6 +1037,20 @@ class MatchEventFantasyIntegrationTests(TestCase):
             away_team=self.away,
         )
 
+        # Lineup rows so get_player_minutes() returns 90 for the scorers.
+        # Without these, score_player_for_match() returns 0 minutes and
+        # therefore 0 points — this is the intended Stage 2 design.
+        MatchLineup.objects.create(
+            match=self.match, team=self.home, player=self.home_att,
+            is_starter=True, subbed_off_minute=90,
+        )
+        MatchLineup.objects.create(
+            match=self.match, team=self.away, player=self.away_att,
+            is_starter=True, subbed_off_minute=90,
+        )
+        Match.objects.filter(pk=self.match.pk).update(minute=90)
+        self.match.refresh_from_db()
+
     def _record(self, **kwargs):
         # Wraps each service call so its on_commit callback actually fires.
         with self.captureOnCommitCallbacks(execute=True):
@@ -1113,18 +1128,26 @@ class MatchEventFantasyIntegrationTests(TestCase):
         self.assertEqual(fp.points, 10)
 
     def test_event_for_player_with_no_prior_row_creates_one(self):
-        self.assertEqual(
-            FantasyPoints.objects.filter(match=self.match).count(), 0
+        # No FantasyPoints row exists for the scorer before the event.
+        self.assertFalse(
+            FantasyPoints.objects.filter(
+                match=self.match, player=self.home_att
+            ).exists()
         )
+
         self._record(
             event_type=MatchEvent.Type.GOAL,
             minute=10,
             team=self.home,
             player=self.home_att,
         )
-        self.assertEqual(
-            FantasyPoints.objects.filter(match=self.match).count(), 1
+
+        # The scorer now has a row with the expected total.
+        fp = FantasyPoints.objects.get(
+            match=self.match, player=self.home_att
         )
+        # ATT goal 4 + appearance 1 + 60+ 1 = 6
+        self.assertEqual(fp.points, 6)
 
     # ------------------------------------------------------------------
     # Transaction safety
@@ -2480,3 +2503,194 @@ class MatchWebSocketRoutingTests(TransactionTestCase):
             self.assertFalse(connected)
 
         async_to_sync(run)()
+
+
+class PublicMatchesAPITests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.org = Organization.objects.create(name="O", slug="o-pub")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-pub",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-pub"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1,
+            name="Gameweek 1",
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-pub"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-pub"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+    def _make_match(self, kickoff_offset_days=0, status_value=Match.Status.SCHEDULED):
+        now_local = timezone.localtime(timezone.now())
+        base = now_local.replace(hour=15, minute=0, second=0, microsecond=0)
+        kickoff = base + timedelta(days=kickoff_offset_days)
+        return Match.objects.create(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=self.stage,
+            kickoff_at=kickoff,
+            status=status_value,
+        )
+
+    def _url(self):
+        return reverse("matches-public:public-matches")
+
+    # -- access -----------------------------------------------------------
+    def test_anonymous_can_access(self):
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_authenticated_can_access(self):
+        from accounts.models import User
+        u = User.objects.create_user(email="u-pub@example.com", password="StrongPass!23")
+        self.client.force_authenticate(user=u)
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+
+    # -- response shape ---------------------------------------------------
+    def test_response_shape(self):
+        self._make_match(kickoff_offset_days=0)
+        resp = self.client.get(self._url(), {"date": "today"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 1)
+        row = resp.data["results"][0]
+        for field in (
+            "id", "competition", "stage", "home_team", "away_team",
+            "kickoff_at", "status", "minute", "home_score", "away_score",
+        ):
+            self.assertIn(field, row)
+        self.assertIn("id", row["competition"])
+        self.assertIn("name", row["competition"])
+        self.assertIn("id", row["home_team"])
+        self.assertIn("name", row["home_team"])
+        self.assertIn("id", row["away_team"])
+
+    # -- today ------------------------------------------------------------
+    def test_today_includes_today(self):
+        self._make_match(kickoff_offset_days=0)
+        resp = self.client.get(self._url(), {"date": "today"})
+        self.assertEqual(resp.data["count"], 1)
+
+    def test_today_excludes_yesterday(self):
+        self._make_match(kickoff_offset_days=-1)
+        resp = self.client.get(self._url(), {"date": "today"})
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_today_excludes_tomorrow(self):
+        self._make_match(kickoff_offset_days=1)
+        resp = self.client.get(self._url(), {"date": "today"})
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_today_excludes_cancelled_and_postponed(self):
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.CANCELLED)
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.POSTPONED)
+        resp = self.client.get(self._url(), {"date": "today"})
+        self.assertEqual(resp.data["count"], 0)
+
+    # -- tomorrow ---------------------------------------------------------
+    def test_tomorrow_includes_tomorrow(self):
+        self._make_match(kickoff_offset_days=1)
+        resp = self.client.get(self._url(), {"date": "tomorrow"})
+        self.assertEqual(resp.data["count"], 1)
+
+    def test_tomorrow_excludes_today(self):
+        self._make_match(kickoff_offset_days=0)
+        resp = self.client.get(self._url(), {"date": "tomorrow"})
+        self.assertEqual(resp.data["count"], 0)
+
+    # -- week -------------------------------------------------------------
+    def test_week_includes_day_zero_through_six(self):
+        for offset in range(7):
+            self._make_match(kickoff_offset_days=offset)
+        resp = self.client.get(self._url(), {"date": "week"})
+        self.assertEqual(resp.data["count"], 7)
+
+    def test_week_excludes_day_seven(self):
+        self._make_match(kickoff_offset_days=7)
+        resp = self.client.get(self._url(), {"date": "week"})
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_week_excludes_yesterday(self):
+        self._make_match(kickoff_offset_days=-1)
+        resp = self.client.get(self._url(), {"date": "week"})
+        self.assertEqual(resp.data["count"], 0)
+
+    # -- live -------------------------------------------------------------
+    def test_status_live_includes_live_and_halftime(self):
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.LIVE)
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.HALFTIME)
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.SCHEDULED)
+        resp = self.client.get(self._url(), {"status": "LIVE"})
+        self.assertEqual(resp.data["count"], 2)
+        statuses = {r["status"] for r in resp.data["results"]}
+        self.assertEqual(statuses, {"LIVE", "HALFTIME"})
+
+    def test_status_live_returns_live_regardless_of_date(self):
+        # A LIVE match whose kickoff was yesterday (long match, delayed update)
+        # should still appear under status=LIVE.
+        self._make_match(kickoff_offset_days=-1, status_value=Match.Status.LIVE)
+        resp = self.client.get(self._url(), {"status": "LIVE"})
+        self.assertEqual(resp.data["count"], 1)
+
+    def test_status_finished_explicit(self):
+        self._make_match(kickoff_offset_days=0, status_value=Match.Status.FINISHED)
+        resp = self.client.get(self._url(), {"status": "FINISHED"})
+        self.assertEqual(resp.data["count"], 1)
+
+    # -- validation -------------------------------------------------------
+    def test_invalid_date_rejected(self):
+        resp = self.client.get(self._url(), {"date": "nextmonth"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_invalid_status_rejected(self):
+        resp = self.client.get(self._url(), {"status": "NOPE"})
+        self.assertEqual(resp.status_code, 400)
+
+    # -- no filters -------------------------------------------------------
+    def test_no_filters_returns_all(self):
+        self._make_match(kickoff_offset_days=0)
+        self._make_match(kickoff_offset_days=5)
+        self._make_match(kickoff_offset_days=-3)
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.data["count"], 3)
+
+
+class ExistingMatchesAPIRegressionTests(TestCase):
+    """Confirm the pre-existing /api/matches/ endpoints are unchanged."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.org = Organization.objects.create(name="O", slug="o-reg")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-reg",
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-reg"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-reg"
+        )
+        self.competition.teams.add(self.home, self.away)
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+        )
+
+    def test_authenticated_match_list_still_works(self):
+        resp = self.client.get(reverse("matches:match-list"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_match_detail_still_works(self):
+        resp = self.client.get(reverse("matches:match-detail", args=[self.match.id]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], self.match.id)
