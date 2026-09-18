@@ -4,6 +4,9 @@ from django.urls import reverse
 from django.test import TestCase
 from django.utils import timezone
 
+from accounts.models import User
+
+from league.services import add_team_manager
 
 from league.models import Competition, Organization, Season, Stage, Team, Player
 from fantasy.models import FantasyPoints
@@ -1797,3 +1800,355 @@ class SubstitutionEdgeCaseTests(TestCase):
         self._sub(self.home_players[0], self.home_players[11], 60)
         with self.assertRaises(MatchError):
             self._sub(self.home_players[1], self.home_players[11], 70)
+
+class LineupAuthorizationTests(TestCase):
+    """
+    Phase 3 — lineup submission is authorized via can_manage_team(user, team).
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+
+        # -- organizations / competition / stage ---------------------------
+        self.org = Organization.objects.create(name="Org LA", slug="org-la")
+        self.other_org = Organization.objects.create(name="Other LA", slug="other-la")
+
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-la",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-la"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+
+        # -- teams ---------------------------------------------------------
+        # A, B, C all participate in the competition; D does not.
+        self.team_a = Team.objects.create(
+            organization=self.org, name="A", slug="a-la"
+        )
+        self.team_b = Team.objects.create(
+            organization=self.org, name="B", slug="b-la"
+        )
+        self.team_c = Team.objects.create(
+            organization=self.org, name="C", slug="c-la"
+        )
+        self.team_d = Team.objects.create(
+            organization=self.org, name="D", slug="d-la"
+        )
+        self.competition.teams.add(self.team_a, self.team_b, self.team_c)
+
+        # -- players (15 each, uniform position is fine for lineup rules) ---
+        def make_players(team, n=15):
+            return [
+                Player.objects.create(
+                    team=team, first_name=f"{team.slug}-P{i}", position="MID"
+                )
+                for i in range(n)
+            ]
+        self.players_a = make_players(self.team_a)
+        self.players_b = make_players(self.team_b)
+        self.players_c = make_players(self.team_c)
+        self.players_d = make_players(self.team_d)
+
+        # -- match A vs B --------------------------------------------------
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.team_a, away_team=self.team_b,
+            stage=self.stage,
+        )
+
+        # -- users ---------------------------------------------------------
+        self.admin = User.objects.create_user(
+            email="admin-la@example.com", password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+        self.superuser = User.objects.create_user(
+            email="root-la@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.superuser.is_superuser = True
+        self.superuser.save(update_fields=["is_superuser"])
+
+        self.scout = User.objects.create_user(
+            email="scout-la@example.com", password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.user = User.objects.create_user(
+            email="user-la@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.manager_a = User.objects.create_user(
+            email="mgr-a@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.manager_c = User.objects.create_user(
+            email="mgr-c@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.manager_d = User.objects.create_user(
+            email="mgr-d@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+
+        add_team_manager(team=self.team_a, user=self.manager_a)
+        add_team_manager(team=self.team_c, user=self.manager_c)
+        add_team_manager(team=self.team_d, user=self.manager_d)
+
+    # -- helpers ---------------------------------------------------------
+    def _url(self, match_id=None, team_id=None):
+        return reverse(
+            "matches:match-lineup",
+            args=[match_id or self.match.id, team_id or self.team_a.id],
+        )
+
+    def _payload(self, team, players, starters_count=11, bench_count=0):
+        return {
+            "team_id": team.id,
+            "starters": [p.id for p in players[:starters_count]],
+            "bench": [p.id for p in players[starters_count:starters_count + bench_count]],
+        }
+
+    def _put(self, url, payload):
+        return self.client.put(url, payload, format="json")
+
+    # =====================================================================
+    # Authorized
+    # =====================================================================
+    def test_team_manager_can_submit_lineup(self):
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a).count(),
+            11,
+        )
+
+    def test_team_manager_can_update_lineup(self):
+        self.client.force_authenticate(user=self.manager_a)
+        self._put(self._url(), self._payload(self.team_a, self.players_a))
+        # Swap the XI
+        resp = self._put(
+            self._url(),
+            self._payload(self.team_a, self.players_a[1:], starters_count=11),
+        )
+        self.assertEqual(resp.status_code, 200)
+        ids = set(
+            MatchLineup.objects.filter(
+                match=self.match, team=self.team_a
+            ).values_list("player_id", flat=True)
+        )
+        self.assertNotIn(self.players_a[0].id, ids)
+
+    def test_admin_can_submit_lineup_for_any_team(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_superuser_can_submit_lineup(self):
+        self.client.force_authenticate(user=self.superuser)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_scout_with_team_manager_relationship_can_submit(self):
+        add_team_manager(team=self.team_a, user=self.scout)
+        self.client.force_authenticate(user=self.scout)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 200)
+
+    # =====================================================================
+    # Unauthorized
+    # =====================================================================
+    def test_normal_user_cannot_submit(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match).count(), 0
+        )
+
+    def test_anonymous_cannot_submit(self):
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match).count(), 0
+        )
+
+    def test_scout_without_manager_relationship_cannot_submit(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_manager_of_other_team_cannot_submit(self):
+        self.client.force_authenticate(user=self.manager_c)
+        # team_c is a participating team but is not in the match -> 400
+        resp = self._put(
+            self._url(team_id=self.team_c.id),
+            self._payload(self.team_c, self.players_c),
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_manager_a_cannot_submit_for_team_b(self):
+        # team_b IS in the match (away), but manager_a does not manage it.
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self._put(
+            self._url(team_id=self.team_b.id),
+            self._payload(self.team_b, self.players_b),
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_unassigned_user_cannot_submit(self):
+        unassigned = User.objects.create_user(
+            email="unassigned-la@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.client.force_authenticate(user=unassigned)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 403)
+
+    # =====================================================================
+    # Team / match / competition validation
+    # =====================================================================
+    def test_team_not_in_match_rejected(self):
+        # team_c participates in the competition but isn't playing this match.
+        self.client.force_authenticate(user=self.manager_c)
+        resp = self._put(
+            self._url(team_id=self.team_c.id),
+            self._payload(self.team_c, self.players_c),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_team_not_in_competition_rejected(self):
+        # Build a match in this competition that references team_d directly
+        # via the ORM — bypasses create_match's participation check so we can
+        # exercise the view's defensive check.
+        weird_match = Match.objects.create(
+            competition=self.competition,
+            home_team=self.team_d, away_team=self.team_a,
+            stage=self.stage,
+        )
+        self.client.force_authenticate(user=self.manager_d)
+        resp = self._put(
+            self._url(match_id=weird_match.id, team_id=self.team_d.id),
+            self._payload(self.team_d, self.players_d),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_unknown_team_404(self):
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self._put(
+            self._url(team_id=999999),
+            self._payload(self.team_a, self.players_a),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_unknown_match_404(self):
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self._put(
+            self._url(match_id=999999),
+            self._payload(self.team_a, self.players_a),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # =====================================================================
+    # Match status locking
+    # =====================================================================
+    def _set_status(self, status_value):
+        Match.objects.filter(pk=self.match.pk).update(status=status_value)
+        self.match.refresh_from_db()
+
+    def test_manager_cannot_update_after_kickoff_live(self):
+        self.client.force_authenticate(user=self.manager_a)
+        self._set_status(Match.Status.LIVE)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_manager_cannot_update_halftime(self):
+        self.client.force_authenticate(user=self.manager_a)
+        self._set_status(Match.Status.HALFTIME)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_manager_cannot_update_finished(self):
+        self.client.force_authenticate(user=self.manager_a)
+        self._set_status(Match.Status.FINISHED)
+        resp = self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.assertEqual(resp.status_code, 400)
+
+    # =====================================================================
+    # Data integrity — no mutation on failed auth or validation
+    # =====================================================================
+    def test_failed_auth_does_not_modify_existing_lineup(self):
+        # Build a valid existing lineup as the manager.
+        self.client.force_authenticate(user=self.manager_a)
+        self._put(self._url(), self._payload(self.team_a, self.players_a))
+        before = sorted(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(len(before), 11)
+
+        # Now attempt a write as an unrelated user.
+        self.client.force_authenticate(user=self.user)
+        resp = self._put(
+            self._url(),
+            self._payload(self.team_a, self.players_a[1:], starters_count=11),
+        )
+        self.assertEqual(resp.status_code, 403)
+
+        after = sorted(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(before, after)
+
+    def test_failed_validation_does_not_modify_existing_lineup(self):
+        # Valid existing lineup.
+        self.client.force_authenticate(user=self.manager_a)
+        self._put(self._url(), self._payload(self.team_a, self.players_a))
+        before = sorted(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a)
+            .values_list("player_id", flat=True)
+        )
+
+        # Attempt an invalid update (only 10 starters).
+        resp = self._put(
+            self._url(),
+            {
+                "team_id": self.team_a.id,
+                "starters": [p.id for p in self.players_a[:10]],
+                "bench": [],
+            },
+        )
+        self.assertEqual(resp.status_code, 400)
+
+        after = sorted(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(before, after)
+
+    def test_team_id_in_body_must_match_url(self):
+        self.client.force_authenticate(user=self.manager_a)
+        payload = self._payload(self.team_a, self.players_a)
+        payload["team_id"] = self.team_b.id  # mismatch
+        resp = self._put(self._url(team_id=self.team_a.id), payload)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match).count(), 0
+        )
+
+    # =====================================================================
+    # GET is still public
+    # =====================================================================
+    def test_get_lineup_is_public(self):
+        self.client.force_authenticate(user=self.manager_a)
+        self._put(self._url(), self._payload(self.team_a, self.players_a))
+        self.client.force_authenticate(user=None)
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), 11)
