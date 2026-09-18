@@ -1,3 +1,11 @@
+from .team_managers import (
+    TeamManagerError,
+    add_team_manager,
+    can_manage_team,
+    is_team_manager,
+    remove_team_manager,
+)
+
 from .league import (
     LeagueError,
     add_player_to_team,

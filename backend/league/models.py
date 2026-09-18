@@ -209,3 +209,37 @@ class Stage(models.Model):
     def __str__(self):
         label = self.name or f"{self.get_kind_display()} {self.number}"
         return f"{self.season} · {label}"
+
+class TeamManager(models.Model):
+    """
+    An authorized manager of a Team.
+
+    A User may manage multiple Teams; a Team may have multiple managers.
+    Being a manager does NOT change the user's global role — it is an
+    additional relationship, not a role.
+    """
+
+    team = models.ForeignKey(
+        Team, on_delete=models.CASCADE, related_name="managers"
+    )
+    user = models.ForeignKey(
+        "accounts.User",
+        on_delete=models.CASCADE,
+        related_name="managed_teams",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["team", "user"],
+                name="uniq_team_manager_per_user_team",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["user", "team"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user} manages {self.team}"

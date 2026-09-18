@@ -1,7 +1,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Competition, Organization, Player, Season, Stage, Team
+from .models import Competition, Organization, Player, Season, Stage, Team, TeamManager
 User = get_user_model()
 
 
@@ -267,4 +267,24 @@ class CompetitionTeamWriteSerializer(serializers.Serializer):
     team_id = serializers.PrimaryKeyRelatedField(
         queryset=Team.objects.all(),
         source="team",
+    )
+
+class TeamManagerSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
+    display_name = serializers.SerializerMethodField()
+    created_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = TeamManager
+        fields = ("user_id", "display_name", "created_at")
+
+    def get_display_name(self, obj):
+        u = obj.user
+        return u.display_name or u.get_full_name() or f"User #{u.id}"
+
+
+class TeamManagerWriteSerializer(serializers.Serializer):
+    user_id = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        source="user",
     )

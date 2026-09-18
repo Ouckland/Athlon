@@ -5,6 +5,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
 
+from accounts.models import User
 from .models import Competition, Organization, Player, Season, Stage, Team
 from .serializers import (
     CompetitionSerializer,
@@ -17,6 +18,8 @@ from .serializers import (
     TeamSerializer,
     TeamBriefSerializer,
     CompetitionTeamWriteSerializer,
+    TeamManagerSerializer,
+    TeamManagerWriteSerializer,
 )
 from .services import (
     LeagueError,
@@ -30,6 +33,9 @@ from .services import (
     create_season,
     add_team_to_competition,
     remove_team_from_competition,
+    TeamManagerError,
+    add_team_manager,
+    remove_team_manager,
 )
 from .permissions import IsAdminOrReadOnly
 
@@ -307,4 +313,43 @@ def competition_team_detail_view(request, competition_id, team_id):
         remove_team_from_competition(competition=competition, team=team)
     except LeagueError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+# ---------------------------------------------------------------------------
+# Team managers
+# ---------------------------------------------------------------------------
+@api_view(["GET", "POST"])
+@permission_classes([IsAdminOrReadOnly])
+def team_managers_view(request, team_id):
+    team = get_object_or_404(Team, pk=team_id)
+
+    if request.method == "GET":
+        qs = team.managers.select_related("user").order_by("-created_at")
+        return Response(TeamManagerSerializer(qs, many=True).data)
+
+    serializer = TeamManagerWriteSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    user = serializer.validated_data["user"]
+
+    try:
+        mgr = add_team_manager(team=team, user=user)
+    except TeamManagerError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(
+        TeamManagerSerializer(mgr).data, status=status.HTTP_201_CREATED
+    )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAdminOrReadOnly])
+def team_manager_detail_view(request, team_id, user_id):
+    team = get_object_or_404(Team, pk=team_id)
+    user = get_object_or_404(User, pk=user_id)
+
+    try:
+        remove_team_manager(team=team, user=user)
+    except TeamManagerError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
     return Response(status=status.HTTP_204_NO_CONTENT)
