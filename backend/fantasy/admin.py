@@ -6,15 +6,15 @@ from .models import (
     FantasyPlayerSelection,
     FantasyPoints,
     FantasyTeam,
+    FantasyPlayerPrice,
 )
 
 
 @admin.register(FantasyTeam)
 class FantasyTeamAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "user", "created_at")
+    list_display = ("id", "name", "user", "starting_budget", "created_at")
     search_fields = ("name", "user__email")
     autocomplete_fields = ("user",)
-
 
 @admin.register(FantasyPlayerSelection)
 class FantasyPlayerSelectionAdmin(admin.ModelAdmin):
@@ -45,3 +45,16 @@ class FantasyPointsAdmin(admin.ModelAdmin):
     search_fields = ("player__first_name", "player__last_name")
     autocomplete_fields = ("match", "player")
     readonly_fields = ("calculated_at", "breakdown")
+
+
+@admin.register(FantasyPlayerPrice)
+class FantasyPlayerPriceAdmin(admin.ModelAdmin):
+    list_display = ("player", "price", "updated_at")
+    list_editable = ("price",)
+    search_fields = (
+        "player__first_name",
+        "player__last_name",
+        "player__display_name",
+    )
+    autocomplete_fields = ("player",)
+

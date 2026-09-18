@@ -19,6 +19,7 @@ User = get_user_model()
 class PlayerBriefSerializer(serializers.ModelSerializer):
     display_name = serializers.SerializerMethodField()
     team = serializers.SerializerMethodField()
+    price = serializers.SerializerMethodField()
 
     class Meta:
         model = Player
@@ -30,6 +31,7 @@ class PlayerBriefSerializer(serializers.ModelSerializer):
             "position",
             "shirt_number",
             "team",
+            "price",
         )
 
     def get_display_name(self, obj):
@@ -40,6 +42,10 @@ class PlayerBriefSerializer(serializers.ModelSerializer):
             return None
         return {"id": obj.team_id, "name": obj.team.name}
 
+    def get_price(self, obj):
+        # Reverse OneToOne; getattr catches RelatedObjectDoesNotExist.
+        price = getattr(obj, "fantasy_price", None)
+        return str(price.price) if price is not None else None
 
 # ---------------------------------------------------------------------------
 # Fantasy team
@@ -50,9 +56,11 @@ class FantasyPlayerSelectionSerializer(serializers.ModelSerializer):
     class Meta:
         model = FantasyPlayerSelection
         fields = ("id", "player", "is_starter", "is_captain")
-
 class FantasyTeamSerializer(serializers.ModelSerializer):
-    from matches.serializers import CompetitionBriefSerializer, SeasonBriefSerializer
+    from matches.serializers import (
+        CompetitionBriefSerializer,
+        SeasonBriefSerializer,
+    )
     competition = CompetitionBriefSerializer(read_only=True)
     season = SeasonBriefSerializer(read_only=True)
     total_points = serializers.SerializerMethodField()
@@ -64,6 +72,7 @@ class FantasyTeamSerializer(serializers.ModelSerializer):
             "name",
             "competition",
             "season",
+            "starting_budget",
             "total_points",
             "created_at",
             "updated_at",
