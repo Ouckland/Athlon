@@ -1419,3 +1419,45 @@ class SeasonLeaderboardNoDoubleCountingTests(FantasyTestBase):
             competition=self.competition, season=self.season
         )
         self.assertEqual(rows[0]["total_points"], 13)
+
+class FantasyGroupOwnerPrivacyTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="owner-priv@example.com", password="StrongPass!23",
+            display_name="Owner Person",
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_create_response_has_owner_id_and_display_name_no_email(self):
+        resp = self.client.post(
+            reverse("fantasy:group-list"), {"name": "G"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("owner_id", resp.data)
+        self.assertIn("owner_display_name", resp.data)
+        self.assertNotIn("owner_email", resp.data)
+        self.assertEqual(resp.data["owner_id"], self.user.id)
+        self.assertEqual(resp.data["owner_display_name"], "Owner Person")
+
+    def test_detail_response_has_owner_id_and_display_name_no_email(self):
+        resp = self.client.post(
+            reverse("fantasy:group-list"), {"name": "G"}, format="json"
+        )
+        gid = resp.data["id"]
+        resp = self.client.get(reverse("fantasy:group-detail", args=[gid]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("owner_id", resp.data)
+        self.assertIn("owner_display_name", resp.data)
+        self.assertNotIn("owner_email", resp.data)
+
+    def test_member_entries_do_not_expose_email(self):
+        resp = self.client.post(
+            reverse("fantasy:group-list"), {"name": "G"}, format="json"
+        )
+        gid = resp.data["id"]
+        resp = self.client.get(reverse("fantasy:group-detail", args=[gid]))
+        for m in resp.data["members"]:
+            self.assertNotIn("email", m)
+            self.assertIn("user_id", m)
+            self.assertIn("display_name", m)

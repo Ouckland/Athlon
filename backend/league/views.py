@@ -94,6 +94,7 @@ def competitions_view(request):
             description=data.get("description", ""),
             season=data.get("season", ""),
             status=data.get("status", Competition.Status.DRAFT),
+            type=data.get("type", Competition.Type.LEAGUE),
             start_date=data.get("start_date"),
             end_date=data.get("end_date"),
         )

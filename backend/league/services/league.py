@@ -40,6 +40,7 @@ def create_competition(
     description="",
     season="",
     status=Competition.Status.DRAFT,
+    type=Competition.Type.LEAGUE,
     start_date=None,
     end_date=None,
     slug=None,
@@ -48,6 +49,8 @@ def create_competition(
         raise LeagueError("Competition name is required.")
     if status not in Competition.Status.values:
         raise LeagueError("Invalid competition status.")
+    if type not in Competition.Type.values:
+        raise LeagueError("Invalid competition type.")
     return Competition.objects.create(
         organization=organization,
         name=name.strip(),
@@ -60,6 +63,7 @@ def create_competition(
         description=description or "",
         season=season or "",
         status=status,
+        type=type,
         start_date=start_date,
         end_date=end_date,
     )

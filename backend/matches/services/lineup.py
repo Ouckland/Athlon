@@ -23,6 +23,9 @@ def submit_lineup(*, match, team, starters, bench):
 
     if team.id not in (match.home_team_id, match.away_team_id):
         raise ValueError("Team is not part of this match.")
+    
+    if not match.competition.teams.filter(id=team.id).exists():
+        raise ValueError("Team is not participating in this competition.")
 
     starters = list(starters)
     bench = list(bench)

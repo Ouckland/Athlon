@@ -8,8 +8,9 @@ from accounts.models import User
 
 from league.services import add_team_manager
 
-from league.models import Competition, Organization, Season, Stage, Team, Player
+from league.models import Competition, Organization, Season, Stage, Team, Player, TeamManager
 from fantasy.models import FantasyPoints
+from league.models import TeamManager
 from matches.models import Match, MatchEvent, MatchLineup
 from matches.services import MatchError, create_match, record_match_event, submit_lineup, get_player_minutes
 from rest_framework.test import APIClient
@@ -2152,3 +2153,330 @@ class LineupAuthorizationTests(TestCase):
         resp = self.client.get(self._url())
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.data), 11)
+
+
+class FullFlowIntegrationTests(TestCase):
+    """
+    End-to-end integration across Stage 3:
+    organization -> competition -> season -> stage -> participating teams
+    -> team manager -> match -> lineup -> event -> fantasy points.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.org = Organization.objects.create(name="Org FF", slug="org-ff")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="League FF", slug="league-ff",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-ff"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+
+        self.team_a = Team.objects.create(
+            organization=self.org, name="A", slug="a-ff"
+        )
+        self.team_b = Team.objects.create(
+            organization=self.org, name="B", slug="b-ff"
+        )
+        # Competition participation
+        self.competition.teams.add(self.team_a, self.team_b)
+
+        def make_players(team):
+            return [
+                Player.objects.create(
+                    team=team, first_name=f"{team.slug}-P{i}", position="MID"
+                )
+                for i in range(15)
+            ]
+
+        self.players_a = make_players(self.team_a)
+        self.players_b = make_players(self.team_b)
+
+        self.admin = User.objects.create_user(
+            email="admin-ff@example.com", password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+        self.manager_a = User.objects.create_user(
+            email="mgr-ff@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        self.scout = User.objects.create_user(
+            email="scout-ff@example.com", password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+
+        # Admin assigns manager_a to team_a (Phase 2 flow)
+        add_team_manager(team=self.team_a, user=self.manager_a)
+
+        # Match (Phase 1 flow already ensured teams are participants)
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.team_a, away_team=self.team_b,
+            stage=self.stage,
+        )
+
+    def _lineup_url(self, match_id=None, team_id=None):
+        return reverse(
+            "matches:match-lineup",
+            args=[match_id or self.match.id, team_id or self.team_a.id],
+        )
+
+    def _events_url(self):
+        return reverse("matches:match-events", args=[self.match.id])
+
+    # ------------------------------------------------------------------
+    def test_full_flow_manager_submits_lineup_scout_records_event(self):
+        # 1. Manager submits lineup
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self.client.put(
+            self._lineup_url(),
+            {
+                "team_id": self.team_a.id,
+                "starters": [p.id for p in self.players_a[:11]],
+                "bench": [p.id for p in self.players_a[11:15]],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match, team=self.team_a).count(),
+            15,
+        )
+
+        # 2. Scout records a goal (SCOUT permission is event-recording, not
+        #    lineup management — that distinction is being verified here).
+        self.client.force_authenticate(user=self.scout)
+        with self.captureOnCommitCallbacks(execute=True):
+            event_resp = self.client.post(
+                self._events_url(),
+                {
+                    "type": "GOAL",
+                    "minute": 10,
+                    "team_id": self.team_a.id,
+                    "player_id": self.players_a[0].id,
+                },
+                format="json",
+            )
+        self.assertEqual(event_resp.status_code, 201)
+        self.assertEqual(event_resp.data["match"]["home_score"], 1)
+
+        # 3. Fantasy points recalculated for all lineup participants.
+        self.assertEqual(
+            FantasyPoints.objects.filter(
+                match=self.match, player__team=self.team_a
+            ).count(),
+            15,
+        )
+
+        # 4. Match is now LIVE, so the lineup is locked.
+        self.match.refresh_from_db()
+        self.assertEqual(self.match.status, Match.Status.LIVE)
+
+        # 5. Manager cannot update lineup now.
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self.client.put(
+            self._lineup_url(),
+            {
+                "team_id": self.team_a.id,
+                "starters": [p.id for p in self.players_a[1:12]],
+                "bench": [],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ------------------------------------------------------------------
+    def test_scout_cannot_assign_self_as_team_manager(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.post(
+            reverse("league:team-managers", args=[self.team_a.id]),
+            {"user_id": self.scout.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(
+            TeamManager.objects.filter(team=self.team_a, user=self.scout).exists()
+        )
+
+    # ------------------------------------------------------------------
+    def test_team_manager_cannot_add_team_to_competition(self):
+        new_team = Team.objects.create(
+            organization=self.org, name="C", slug="c-ff"
+        )
+        self.client.force_authenticate(user=self.manager_a)
+        resp = self.client.post(
+            reverse("league:competition-teams", args=[self.competition.id]),
+            {"team_id": new_team.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(
+            self.competition.teams.filter(id=new_team.id).exists()
+        )
+
+    # ------------------------------------------------------------------
+    def test_lineup_rejected_for_non_participating_team(self):
+        # Rogue team and rogue manager bypass Phase 1's participation rule by
+        # creating the Match directly (not via create_match).
+        rogue = Team.objects.create(
+            organization=self.org, name="Rogue", slug="rogue-ff"
+        )
+        rogue_players = [
+            Player.objects.create(
+                team=rogue, first_name=f"R{i}", position="MID"
+            )
+            for i in range(15)
+        ]
+        rogue_manager = User.objects.create_user(
+            email="rogue-ff@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+        add_team_manager(team=rogue, user=rogue_manager)
+
+        bad_match = Match.objects.create(
+            competition=self.competition,
+            home_team=rogue, away_team=self.team_a,
+            stage=self.stage,
+        )
+
+        self.client.force_authenticate(user=rogue_manager)
+        resp = self.client.put(
+            reverse("matches:match-lineup", args=[bad_match.id, rogue.id]),
+            {
+                "team_id": rogue.id,
+                "starters": [p.id for p in rogue_players[:11]],
+                "bench": [],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            MatchLineup.objects.filter(match=bad_match).count(), 0
+        )
+class LineupViewSingleDefinitionTests(TestCase):
+    """
+    Regression: match_lineup_view used to be defined twice in views.py.
+    This test confirms the view behaves per the canonical (auth-first)
+    implementation.
+    """
+
+    def setUp(self):
+        from accounts.models import User
+        from league.models import (
+            Competition, Organization, Player, Season, Stage, Team,
+        )
+        from league.services import add_team_manager
+
+        self.org = Organization.objects.create(name="O", slug="o-single")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-single",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-single"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-single"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-single"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        self.players = [
+            Player.objects.create(
+                team=self.home, first_name=f"P{i}", position="MID"
+            )
+            for i in range(15)
+        ]
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+        self.stranger = User.objects.create_user(
+            email="stranger-single@example.com", password="StrongPass!23",
+            role=User.Role.USER,
+        )
+
+    def test_unauthorized_put_returns_403_before_400(self):
+        # Team is in the match, so a 400-before-403 implementation would
+        # not trigger either way. Use a team *not* in the match to prove
+        # authorization runs first.
+        other = Team.objects.create(
+            organization=self.org, name="Other", slug="other-single"
+        )
+        self.competition.teams.add(other)
+        client = APIClient()
+        client.force_authenticate(user=self.stranger)
+        resp = client.put(
+            reverse("matches:match-lineup", args=[self.match.id, other.id]),
+            {"team_id": other.id, "starters": [], "bench": []},
+            format="json",
+        )
+        # Auth gate fails first -> 403, not 400.
+        self.assertEqual(resp.status_code, 403)
+
+    def test_get_is_public(self):
+        client = APIClient()
+        resp = client.get(
+            reverse("matches:match-lineup", args=[self.match.id, self.home.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+
+
+from channels.testing import WebsocketCommunicator
+from config.asgi import application
+
+
+class MatchWebSocketRoutingTests(TransactionTestCase):
+    """
+    Confirms the WebSocket route is wired through config.asgi and that the
+    consumer accepts a public connection to an existing match.
+    """
+
+    def setUp(self):
+        from league.models import Competition, Organization, Team
+        self.org = Organization.objects.create(name="O", slug="o-ws")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-ws",
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-ws"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-ws"
+        )
+        self.competition.teams.add(self.home, self.away)
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+        )
+
+    def test_public_connection_receives_initial_state(self):
+        async def run():
+            comm = WebsocketCommunicator(application, f"/ws/matches/{self.match.id}/")
+            connected, _ = await comm.connect()
+            self.assertTrue(connected)
+            msg = await comm.receive_json_from()
+            self.assertEqual(msg["type"], "match_state")
+            self.assertEqual(msg["match"]["id"], self.match.id)
+            self.assertEqual(msg["events"], [])
+            await comm.disconnect()
+
+        async_to_sync(run)()
+
+    def test_unknown_match_closes(self):
+        async def run():
+            comm = WebsocketCommunicator(application, "/ws/matches/999999/")
+            connected, _ = await comm.connect()
+            self.assertFalse(connected)
+
+        async_to_sync(run)()
