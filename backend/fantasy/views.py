@@ -19,7 +19,9 @@ from .serializers import (
     SquadWriteSerializer,
     FantasyTransferSerializer,
     TransferCreateSerializer,
+    GameweekPointsSerializer,
 )
+
 from .services import (
     FantasyError,
     create_fantasy_team,
@@ -37,6 +39,8 @@ from .services import (
     make_transfer,
     transfers_remaining,
     transfers_used,
+    get_gameweek_points,
+
 )
 
 
@@ -383,3 +387,38 @@ def team_transfers_view(request, team_id):
         },
         status=status.HTTP_201_CREATED,
     )
+
+# ---------------------------------------------------------------------------
+# Gameweek points
+# ---------------------------------------------------------------------------
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def team_points_view(request, team_id):
+    team = _my_team_or_404(request, team_id)
+
+    stage_param = request.query_params.get("stage")
+    if not stage_param:
+        return Response(
+            {"detail": "Query parameter 'stage' is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        stage_id = int(stage_param)
+    except (TypeError, ValueError):
+        return Response(
+            {"detail": "Query parameter 'stage' must be an integer."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    stage = get_object_or_404(
+        Stage.objects.select_related("season"), pk=stage_id
+    )
+
+    try:
+        data = get_gameweek_points(fantasy_team=team, stage=stage)
+    except FantasyError as exc:
+        return Response(
+            {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    return Response(GameweekPointsSerializer(data).data)

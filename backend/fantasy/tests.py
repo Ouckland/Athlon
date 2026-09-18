@@ -7,6 +7,8 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
+
+
 from league.models import Competition, Organization, Player, Season, Stage, Team
 from matches.models import Match, MatchEvent, MatchLineup
 from matches.services import MatchError, create_match, record_match_event
@@ -49,7 +51,8 @@ from .services import (
     get_player_price,
     set_player_price,
     squad_total_cost,
-    make_transfer, transfers_remaining, transfers_used
+    make_transfer, transfers_remaining, 
+    transfers_used,get_gameweek_points
 )
 
 User = get_user_model()
@@ -2340,3 +2343,293 @@ class TransferAPITests(FantasyTestBase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("detail", resp.data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Gameweek points
+# ---------------------------------------------------------------------------
+class GameweekPointsServiceTests(FantasyTestBase):
+    """
+    Layout of _make_valid_squad's flat player list (15 players):
+        0     GK starter (captain by default)
+        1     GK starter
+        2-6   DEF starters
+        7-10  MID starters
+        11    MID bench
+        12-14 ATT bench
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        set_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+
+    def _match(self, stage, home=None, away=None):
+        return Match.objects.create(
+            competition=self.competition,
+            home_team=home or self.home,
+            away_team=away or self.away,
+            stage=stage,
+        )
+
+    def _points(self, match, player, points):
+        return FantasyPoints.objects.create(
+            match=match, player=player, points=points
+        )
+
+    # -- basic totals -----------------------------------------------------
+    def test_empty_gameweek_returns_zeros(self):
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["total_points"], 0)
+        self.assertEqual(data["starting_xi_points"], 0)
+        self.assertEqual(data["bench_points"], 0)
+        self.assertEqual(len(data["players"]), 15)
+
+    def test_starter_points_aggregate(self):
+        m = self._match(self.stage)
+        self._points(m, self.players[1], 5)   # GK starter
+        self._points(m, self.players[2], 7)   # DEF starter
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        # captain (players[0]) has 0 points, so no multiplier effect
+        self.assertEqual(data["total_points"], 12)
+        self.assertEqual(data["starting_xi_points"], 12)
+
+    def test_captain_multiplied_by_two(self):
+        m = self._match(self.stage)
+        self._points(m, self.players[0], 8)   # captain (GK starter)
+        self._points(m, self.players[2], 5)   # non-captain starter
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        # 8 * 2 + 5 = 21
+        self.assertEqual(data["total_points"], 21)
+        captain_row = next(p for p in data["players"] if p["is_captain"])
+        self.assertEqual(captain_row["base_points"], 8)
+        self.assertEqual(captain_row["multiplier"], 2)
+        self.assertEqual(captain_row["points"], 16)
+
+    def test_bench_points_excluded_from_total(self):
+        m = self._match(self.stage)
+        self._points(m, self.players[11], 10)  # bench MID
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["total_points"], 0)
+        self.assertEqual(data["starting_xi_points"], 0)
+        self.assertEqual(data["bench_points"], 10)
+        # But the bench row is still returned
+        bench_row = next(p for p in data["players"] if not p["is_starter"])
+        self.assertEqual(bench_row["base_points"], 10)
+
+    def test_bench_players_appear_in_response(self):
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        bench_rows = [p for p in data["players"] if not p["is_starter"]]
+        starter_rows = [p for p in data["players"] if p["is_starter"]]
+        self.assertEqual(len(bench_rows), 4)
+        self.assertEqual(len(starter_rows), 11)
+
+    def test_zero_point_players_still_appear(self):
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        # All 15 rows present even though none scored.
+        self.assertEqual(len(data["players"]), 15)
+        for p in data["players"]:
+            self.assertEqual(p["base_points"], 0)
+            self.assertEqual(p["points"], 0)
+
+    # -- multi-match aggregation -----------------------------------------
+    def test_multi_match_in_same_stage_aggregates(self):
+        m1 = self._match(self.stage)
+        m2 = self._match(self.stage)
+        self._points(m1, self.players[1], 5)
+        self._points(m2, self.players[1], 3)
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        # players[1] is a non-captain starter → contributes 8
+        self.assertEqual(data["total_points"], 8)
+
+    def test_points_from_other_stage_do_not_contribute(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        m1 = self._match(self.stage)
+        m2 = self._match(stage2)
+        self._points(m1, self.players[1], 6)
+        self._points(m2, self.players[1], 10)
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["total_points"], 6)
+
+    # -- historical integrity --------------------------------------------
+    def test_historical_gameweek_uses_its_own_squad(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        # GW2 squad: swap one bench MID for a new one.
+        new_mid = self._player(self.away, "MID", "NewMID")
+        gw2_payload = [
+            {"player_id": new_mid.id if s["player_id"] == self.players[11].id else s["player_id"],
+             "is_starter": s["is_starter"],
+             "is_captain": s["is_captain"]}
+            for s in self.valid
+        ]
+        set_squad(
+            fantasy_team=self.team, stage=stage2, selections=gw2_payload
+        )
+
+        m1 = self._match(self.stage)
+        m2 = self._match(stage2)
+        self._points(m1, self.players[11], 9)   # in GW1 squad
+        self._points(m2, self.players[11], 20)  # not in GW2 squad
+        self._points(m2, new_mid, 4)            # in GW2 squad
+
+        gw1 = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        gw2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
+
+        # GW1: bench MID scored 9 → bench_points = 9, total = 0
+        self.assertEqual(gw1["bench_points"], 9)
+        self.assertEqual(gw1["total_points"], 0)
+        # GW2: new_mid is bench → bench_points = 4
+        self.assertEqual(gw2["bench_points"], 4)
+        self.assertEqual(gw2["total_points"], 0)
+
+    # -- stage validation ------------------------------------------------
+    def test_round_stage_rejected(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-p4",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-p4"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        with self.assertRaises(FantasyError):
+            get_gameweek_points(fantasy_team=self.team, stage=round_stage)
+
+    def test_wrong_season_rejected(self):
+        other_season = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-p4"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(FantasyError):
+            get_gameweek_points(fantasy_team=self.team, stage=other_stage)
+
+    def test_wrong_competition_rejected(self):
+        other_comp = Competition.objects.create(
+            organization=self.org, name="L2", slug="l2-p4",
+            type=Competition.Type.LEAGUE,
+        )
+        other_season = Season.objects.create(
+            competition=other_comp, name="2026", slug="2026-l2-p4"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(FantasyError):
+            get_gameweek_points(fantasy_team=self.team, stage=other_stage)
+
+    def test_no_squad_for_stage_returns_empty(self):
+        stage_empty = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=3
+        )
+        data = get_gameweek_points(
+            fantasy_team=self.team, stage=stage_empty
+        )
+        self.assertEqual(data["total_points"], 0)
+        self.assertEqual(data["players"], [])
+
+
+class GameweekPointsAPITests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        set_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+
+    def _url(self):
+        return reverse("fantasy:team-points", args=[self.team.id])
+
+    def _match(self, stage, home=None, away=None):
+        return Match.objects.create(
+            competition=self.competition,
+            home_team=home or self.home,
+            away_team=away or self.away,
+            stage=stage,
+        )
+
+    def _points(self, match, player, points):
+        return FantasyPoints.objects.create(
+            match=match, player=player, points=points
+        )
+
+    def test_owner_can_retrieve_points(self):
+        m = self._match(self.stage)
+        self._points(m, self.players[0], 8)   # captain
+        self._points(m, self.players[1], 5)   # non-captain starter
+        resp = self.client.get(self._url(), {"stage": self.stage.id})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["total_points"], 21)
+        self.assertEqual(resp.data["starting_xi_points"], 21)
+        self.assertIn("stage", resp.data)
+        self.assertEqual(resp.data["stage"]["id"], self.stage.id)
+        self.assertIn("players", resp.data)
+        self.assertEqual(len(resp.data["players"]), 15)
+        # Sample player row shape.
+        row = resp.data["players"][0]
+        for key in ("player", "is_starter", "is_captain",
+                    "base_points", "multiplier", "points"):
+            self.assertIn(key, row)
+
+    def test_anonymous_rejected(self):
+        anon = APIClient()
+        resp = anon.get(self._url(), {"stage": self.stage.id})
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_other_user_cannot_retrieve(self):
+        other = User.objects.create_user(
+            email="other-p4@example.com", password="StrongPass!23"
+        )
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+        resp = other_client.get(self._url(), {"stage": self.stage.id})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_missing_stage_param_rejected(self):
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 400)
+
+    def test_non_integer_stage_rejected(self):
+        resp = self.client.get(self._url(), {"stage": "abc"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_stage_404(self):
+        resp = self.client.get(self._url(), {"stage": 999999})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_round_stage_rejected(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-p4a",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-p4a"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        resp = self.client.get(self._url(), {"stage": round_stage.id})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_wrong_season_rejected(self):
+        other_season = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-p4a"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        resp = self.client.get(self._url(), {"stage": other_stage.id})
+        self.assertEqual(resp.status_code, 400)
