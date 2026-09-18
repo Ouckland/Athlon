@@ -545,3 +545,222 @@ class SeasonStageTests(TestCase):
             {"kind": "GAMEWEEK", "number": 1}, format="json",
         )
         self.assertIn(resp.status_code, (401, 403))
+
+# ---------------------------------------------------------------------------
+# Competition participation
+# ---------------------------------------------------------------------------
+class CompetitionParticipationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_user(
+            email="admin-cp@example.com",
+            password="StrongPass!23",
+            role=User.Role.ADMIN,
+        )
+        self.scout = User.objects.create_user(
+            email="scout-cp@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.user = User.objects.create_user(
+            email="user-cp@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
+        )
+
+        self.org = Organization.objects.create(name="Org CP", slug="org-cp")
+        self.other_org = Organization.objects.create(name="Other", slug="other-cp")
+
+        self.competition = Competition.objects.create(
+            organization=self.org, name="League",
+            slug="league-cp", type=Competition.Type.LEAGUE,
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="Home", slug="home-cp"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="Away", slug="away-cp"
+        )
+        self.outsider_team = Team.objects.create(
+            organization=self.other_org, name="Outsider", slug="outsider-cp"
+        )
+
+    # -- helpers ---------------------------------------------------------
+    def _list_url(self, competition_id=None):
+        return reverse(
+            "league:competition-teams",
+            args=[competition_id or self.competition.id],
+        )
+
+    def _detail_url(self, team_id=None, competition_id=None):
+        return reverse(
+            "league:competition-team-detail",
+            args=[
+                competition_id or self.competition.id,
+                team_id or self.home.id,
+            ],
+        )
+
+    # -- list ------------------------------------------------------------
+    def test_list_participating_teams_is_public(self):
+        self.competition.teams.add(self.home)
+        resp = self.client.get(self._list_url())
+        self.assertEqual(resp.status_code, 200)
+        ids = [t["id"] for t in resp.data]
+        self.assertIn(self.home.id, ids)
+        self.assertNotIn(self.away.id, ids)
+
+    def test_list_empty_competition_returns_empty_array(self):
+        resp = self.client.get(self._list_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+    # -- add -------------------------------------------------------------
+    def test_admin_can_add_team(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.home.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["id"], self.home.id)
+        self.assertTrue(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_add_is_idempotent(self):
+        self.competition.teams.add(self.home)
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.home.id}, format="json"
+        )
+        self.assertIn(resp.status_code, (200, 201))
+        self.assertEqual(
+            self.competition.teams.filter(id=self.home.id).count(), 1
+        )
+
+    def test_anonymous_cannot_add_team(self):
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.home.id}, format="json"
+        )
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertFalse(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_scout_cannot_add_team(self):
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.home.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_normal_user_cannot_add_team(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.home.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_cannot_add_team_from_different_organization(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"team_id": self.outsider_team.id}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+        self.assertFalse(
+            self.competition.teams.filter(id=self.outsider_team.id).exists()
+        )
+
+    def test_cannot_add_nonexistent_team(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            self._list_url(), {"team_id": 999999}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cannot_add_without_team_id(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(self._list_url(), {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    # -- remove ----------------------------------------------------------
+    def test_admin_can_remove_team(self):
+        self.competition.teams.add(self.home)
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url())
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_anonymous_cannot_remove_team(self):
+        self.competition.teams.add(self.home)
+        resp = self.client.delete(self._detail_url())
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_scout_cannot_remove_team(self):
+        self.competition.teams.add(self.home)
+        self.client.force_authenticate(user=self.scout)
+        resp = self.client.delete(self._detail_url())
+        self.assertEqual(resp.status_code, 403)
+        self.assertTrue(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    def test_remove_non_participating_team_fails(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url())
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_cannot_remove_team_with_matches(self):
+        self.competition.teams.add(self.home, self.away)
+        from matches.services import create_match
+        create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+        )
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.delete(self._detail_url())
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+
+    # -- multi-competition participation ---------------------------------
+    def test_team_can_participate_in_multiple_competitions(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup",
+            slug="cup-cp", type=Competition.Type.CUP,
+        )
+        self.competition.teams.add(self.home)
+        cup.teams.add(self.home)
+        self.assertTrue(
+            self.competition.teams.filter(id=self.home.id).exists()
+        )
+        self.assertTrue(cup.teams.filter(id=self.home.id).exists())
+
+    def test_team_can_participate_in_multiple_org_competitions(self):
+        # A team is bound to one organization. A competition in a different
+        # organization cannot have that team.
+        other_comp = Competition.objects.create(
+            organization=self.other_org, name="OtherLeague",
+            slug="other-league-cp", type=Competition.Type.LEAGUE,
+        )
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.post(
+            reverse("league:competition-teams", args=[other_comp.id]),
+            {"team_id": self.home.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(
+            other_comp.teams.filter(id=self.home.id).exists()
+        )

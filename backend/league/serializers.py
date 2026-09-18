@@ -262,3 +262,9 @@ class PlayerSerializer(serializers.ModelSerializer):
         if value < 1 or value > 99:
             raise serializers.ValidationError("Shirt number must be between 1 and 99.")
         return value
+
+class CompetitionTeamWriteSerializer(serializers.Serializer):
+    team_id = serializers.PrimaryKeyRelatedField(
+        queryset=Team.objects.all(),
+        source="team",
+    )

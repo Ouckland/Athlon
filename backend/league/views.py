@@ -15,6 +15,8 @@ from .serializers import (
     StageCreateSerializer,
     StageSerializer,
     TeamSerializer,
+    TeamBriefSerializer,
+    CompetitionTeamWriteSerializer,
 )
 from .services import (
     LeagueError,
@@ -26,7 +28,10 @@ from .services import (
     set_team_captain,
     set_team_competitions,
     create_season,
+    add_team_to_competition,
+    remove_team_from_competition,
 )
+from .permissions import IsAdminOrReadOnly
 
 
 # ---------------------------------------------------------------------------
@@ -268,3 +273,38 @@ def stage_detail_view(request, pk):
         Stage.objects.select_related("season", "season__competition"), pk=pk
     )
     return Response(StageSerializer(stage).data)
+
+# ---------------------------------------------------------------------------
+# Competition participation
+# ---------------------------------------------------------------------------
+@api_view(["GET", "POST"])
+@permission_classes([IsAdminOrReadOnly])
+def competition_teams_view(request, competition_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+
+    if request.method == "GET":
+        qs = competition.teams.all().order_by("name")
+        return Response(TeamBriefSerializer(qs, many=True).data)
+
+    serializer = CompetitionTeamWriteSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    team = serializer.validated_data["team"]
+    try:
+        add_team_to_competition(competition=competition, team=team)
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        TeamBriefSerializer(team).data, status=status.HTTP_201_CREATED
+    )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAdminOrReadOnly])
+def competition_team_detail_view(request, competition_id, team_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+    team = get_object_or_404(Team, pk=team_id)
+    try:
+        remove_team_from_competition(competition=competition, team=team)
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(status=status.HTTP_204_NO_CONTENT)

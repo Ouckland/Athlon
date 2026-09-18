@@ -220,3 +220,51 @@ def create_stage(
         raise LeagueError(
             "A stage with that number already exists in this season."
         ) from exc
+
+
+def add_team_to_competition(*, competition, team):
+    """
+    Add a team to a competition's participating teams.
+
+    Rules:
+      - Team must belong to the same organization as the competition.
+      - Idempotent: re-adding an already-participating team is a no-op.
+    """
+    if team.organization_id != competition.organization_id:
+        raise LeagueError(
+            "Team organization must match the competition's organization."
+        )
+    if not competition.teams.filter(id=team.id).exists():
+        competition.teams.add(team)
+    return team
+
+
+def remove_team_from_competition(*, competition, team):
+    """
+    Remove a team from a competition's participating teams.
+
+    Rejects removal if:
+      - the team is not currently participating, or
+      - the team has any match in this competition (removing participation
+        while matches still reference the team would leave the competition
+        in an inconsistent state — the lineup and match APIs assume a match's
+        teams are participating in the match's competition).
+    """
+    if not competition.teams.filter(id=team.id).exists():
+        raise LeagueError("Team is not participating in this competition.")
+
+    # Runtime import to preserve the dependency direction (league -> matches
+    # is allowed at runtime; a module-level import would create a cycle since
+    # matches.models imports league.models).
+    from django.db.models import Q
+    from matches.models import Match
+
+    if Match.objects.filter(competition=competition).filter(
+        Q(home_team=team) | Q(away_team=team)
+    ).exists():
+        raise LeagueError(
+            "Cannot remove a team that has matches in this competition."
+        )
+
+    competition.teams.remove(team)
+

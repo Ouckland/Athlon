@@ -25,4 +25,14 @@ urlpatterns = [
         name="season-stages",
     ),
     path("stages/<int:pk>/", views.stage_detail_view, name="stage-detail"),
+        path(
+        "competitions/<int:competition_id>/teams/",
+        views.competition_teams_view,
+        name="competition-teams",
+    ),
+    path(
+        "competitions/<int:competition_id>/teams/<int:team_id>/",
+        views.competition_team_detail_view,
+        name="competition-team-detail",
+    ),
 ]

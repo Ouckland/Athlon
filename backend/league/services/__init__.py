@@ -8,7 +8,9 @@ from .league import (
     create_organization,
     create_team,
     set_team_captain,
-    set_team_competitions
+    set_team_competitions,
+    add_team_to_competition,
+    remove_team_from_competition
 )
 
 __all__ = [
