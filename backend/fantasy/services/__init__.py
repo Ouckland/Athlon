@@ -28,10 +28,12 @@ from .teams import (
     FantasyError,
     create_fantasy_team,
     get_player_price,
+    is_gameweek_locked,
     set_player_price,
     set_squad,
     squad_total_cost,
     validate_player_eligibility,
+    validate_stage_for_fantasy,
 )
 
 
@@ -47,5 +49,7 @@ __all__ = [
     # leaderboards
     "fantasy_team_total_points", "stage_leaderboard", "season_leaderboard",
     "group_stage_leaderboard", "group_season_leaderboard",
+    # Teams
     "set_player_price","get_player_price","squad_total_cost",
+    "is_gameweek_locked","validate_stage_for_fantasy",
 ]

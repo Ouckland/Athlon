@@ -1,9 +1,8 @@
 from collections import Counter
 from decimal import Decimal
-
+from django.utils import timezone
+from django.db.models import Q
 from django.db import transaction
-
-from league.models import Player
 
 from fantasy.constants import (
     MAX_PLAYER_PRICE,
@@ -16,6 +15,8 @@ from fantasy.models import (
     FantasyTeam,
 )
 
+from league.models import Player, Stage
+from matches.models import Match
 
 class FantasyError(Exception):
     """Raised when a fantasy domain rule is violated."""
@@ -111,17 +112,81 @@ def validate_player_eligibility(player, competition):
 
 
 # ---------------------------------------------------------------------------
+# Gameweek (Stage) validation and locking
+# ---------------------------------------------------------------------------
+def validate_stage_for_fantasy(*, fantasy_team, stage):
+    """
+    Ensure `stage` is a valid fantasy gameweek for `fantasy_team`.
+
+    Rules:
+      - kind must be GAMEWEEK (ROUND is not a fantasy stage)
+      - stage's season must match the fantasy team's season
+      - stage's season's competition must match the fantasy team's competition
+
+    Raises FantasyError on any violation.
+    """
+    if stage.kind != Stage.Kind.GAMEWEEK:
+        raise FantasyError(
+            "Only GAMEWEEK stages can be used for fantasy squads."
+        )
+    if stage.season_id != fantasy_team.season_id:
+        raise FantasyError(
+            "Stage does not belong to this fantasy team's season."
+        )
+    if stage.season.competition_id != fantasy_team.competition_id:
+        raise FantasyError(
+            "Stage's competition does not match the fantasy team's competition."
+        )
+
+
+def is_gameweek_locked(stage):
+    """
+    A gameweek is locked once any of its matches has started.
+
+    A match is considered to have started if either:
+      - its status is LIVE, HALFTIME, or FINISHED, or
+      - its kickoff_at is in the past and it was not postponed/cancelled.
+
+    Returns True if locked, False otherwise.
+    """
+    now = timezone.now()
+    started_statuses = (
+        Match.Status.LIVE,
+        Match.Status.HALFTIME,
+        Match.Status.FINISHED,
+    )
+    return (
+        Match.objects.filter(stage=stage)
+        .filter(
+            Q(status__in=started_statuses)
+            | (
+                Q(kickoff_at__lte=now)
+                & ~Q(
+                    status__in=(
+                        Match.Status.POSTPONED,
+                        Match.Status.CANCELLED,
+                    )
+                )
+            )
+        )
+        .exists()
+    )
+
+# ---------------------------------------------------------------------------
 # Squad
 # ---------------------------------------------------------------------------
 def set_squad(*, fantasy_team, stage, selections):
     """
-    Replace the fantasy team's squad for a given stage.
+    Replace the fantasy team's squad for a given gameweek.
 
     `selections` is a list of dicts:
         {"player_id": int, "is_starter": bool, "is_captain": bool}
     """
-    if stage.season_id != fantasy_team.season_id:
-        raise FantasyError("Stage does not belong to this fantasy team's season.")
+    validate_stage_for_fantasy(fantasy_team=fantasy_team, stage=stage)
+    if is_gameweek_locked(stage):
+        raise FantasyError(
+            "This gameweek is locked; the squad can no longer be changed."
+        )
     _validate_squad(fantasy_team, selections)
 
     with transaction.atomic():

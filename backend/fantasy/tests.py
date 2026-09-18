@@ -1,3 +1,6 @@
+from datetime import timedelta
+
+from django.utils import timezone
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
@@ -1578,3 +1581,298 @@ class FantasyEconomyTests(FantasyTestBase):
         rows = list(team.selections.filter(stage=self.stage))
         total = squad_total_cost(rows)
         self.assertEqual(total, Decimal("75.0"))
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Gameweek scope
+# ---------------------------------------------------------------------------
+class GameweekScopeTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        _, self.valid = self._make_valid_squad()
+
+    # -- stage kind -------------------------------------------------------
+    def test_gameweek_stage_accepted(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), 15
+        )
+
+    def test_round_stage_rejected(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-p2",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-p2"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(
+                fantasy_team=self.team, stage=round_stage, selections=self.valid
+            )
+        self.assertIn("GAMEWEEK", str(ctx.exception))
+
+    # -- season consistency ----------------------------------------------
+    def test_stage_from_same_season_accepted(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        set_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=stage2).count(), 15
+        )
+
+    def test_stage_from_different_season_rejected(self):
+        other_season = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-p2"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(
+                fantasy_team=self.team,
+                stage=other_stage,
+                selections=self.valid,
+            )
+        self.assertIn("season", str(ctx.exception).lower())
+
+    # -- competition consistency -----------------------------------------
+    def test_stage_from_different_competition_rejected(self):
+        other_comp = Competition.objects.create(
+            organization=self.org, name="L2", slug="l2-p2",
+            type=Competition.Type.LEAGUE,
+        )
+        other_season = Season.objects.create(
+            competition=other_comp, name="2026", slug="2026-l2-p2"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(
+                fantasy_team=self.team,
+                stage=other_stage,
+                selections=self.valid,
+            )
+        # season check fires first, so the message mentions "season"
+        self.assertIn("season", str(ctx.exception).lower())
+
+    # -- atomicity on rejection ------------------------------------------
+    def test_rejected_stage_leaves_existing_squad_unchanged(self):
+        # Set a valid squad for the real gameweek.
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        before = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+
+        # Attempt a submission against a ROUND stage — must fail.
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup2", slug="cup2-p2",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-cup2-p2"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        with self.assertRaises(FantasyError):
+            set_squad(
+                fantasy_team=self.team,
+                stage=round_stage,
+                selections=self.valid,
+            )
+
+        after = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(before, after)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Historical gameweek state
+# ---------------------------------------------------------------------------
+class GameweekHistoricalTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        self.stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+
+    def test_two_gameweeks_coexist(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        # Swap one player for GW2.
+        new_player = self._player(self.home, "ATT", "NewATT", price=Decimal("5.0"))
+        swapped = [dict(s) for s in self.valid]
+        swapped[-1]["player_id"] = new_player.id
+        set_squad(fantasy_team=self.team, stage=self.stage2, selections=swapped)
+
+        gw1 = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        gw2 = set(
+            self.team.selections.filter(stage=self.stage2)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(len(gw1), 15)
+        self.assertEqual(len(gw2), 15)
+        self.assertNotEqual(gw1, gw2)
+        self.assertIn(new_player.id, gw2)
+        self.assertNotIn(new_player.id, gw1)
+
+    def test_gw1_unchanged_after_gw2_submission(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        gw1_before = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+
+        # GW2 with a completely different squad.
+        other_players, other_squad = self._make_valid_squad(team=self.away)
+        set_squad(
+            fantasy_team=self.team, stage=self.stage2, selections=other_squad
+        )
+
+        gw1_after = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(gw1_before, gw1_after)
+
+    def test_resubmit_same_gameweek_replaces_only_that_gameweek(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        set_squad(fantasy_team=self.team, stage=self.stage2, selections=self.valid)
+        gw2_before = set(
+            self.team.selections.filter(stage=self.stage2)
+            .values_list("player_id", flat=True)
+        )
+
+        # Replace GW1 with a different squad.
+        new_player = self._player(self.home, "ATT", "NewATT2", price=Decimal("5.0"))
+        swapped = [dict(s) for s in self.valid]
+        swapped[-1]["player_id"] = new_player.id
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=swapped)
+
+        gw2_after = set(
+            self.team.selections.filter(stage=self.stage2)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(gw2_before, gw2_after)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), 15
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Gameweek locking
+# ---------------------------------------------------------------------------
+class GameweekLockingTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        _, self.valid = self._make_valid_squad()
+
+    def _start_match_in_stage(self, stage, *, status=Match.Status.LIVE,
+                              minutes_ago=60):
+        Match.objects.create(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=stage,
+            kickoff_at=timezone.now() - timedelta(minutes=minutes_ago),
+            status=status,
+        )
+
+    # -- open -------------------------------------------------------------
+    def test_open_gameweek_can_be_edited(self):
+        # Default fixture: one SCHEDULED match with kickoff_at=None.
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), 15
+        )
+
+    # -- locked -----------------------------------------------------------
+    def test_locked_gameweek_rejected_on_put(self):
+        self._start_match_in_stage(self.stage)
+        with self.assertRaises(FantasyError) as ctx:
+            set_squad(
+                fantasy_team=self.team, stage=self.stage, selections=self.valid
+            )
+        self.assertIn("locked", str(ctx.exception).lower())
+
+    def test_locked_gameweek_via_status_only(self):
+        # kickoff_at is null but status is FINISHED — must lock.
+        Match.objects.create(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=self.stage,
+            kickoff_at=None,
+            status=Match.Status.FINISHED,
+        )
+        with self.assertRaises(FantasyError):
+            set_squad(
+                fantasy_team=self.team, stage=self.stage, selections=self.valid
+            )
+
+    def test_locked_gameweek_is_still_readable(self):
+        # Seed a squad first, then lock.
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self._start_match_in_stage(self.stage)
+
+        # A read is a plain ORM query — should still work.
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), 15
+        )
+        # And the locked helper reports True.
+        from fantasy.services import is_gameweek_locked
+        self.assertTrue(is_gameweek_locked(self.stage))
+
+    def test_postponed_match_with_past_kickoff_does_not_lock(self):
+        Match.objects.create(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=self.stage,
+            kickoff_at=timezone.now() - timedelta(hours=2),
+            status=Match.Status.POSTPONED,
+        )
+        # The default self.match (SCHEDULED, null kickoff) also exists.
+        # Neither should lock.
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), 15
+        )
+
+    def test_locked_submission_leaves_existing_squad_unchanged(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        before = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+
+        self._start_match_in_stage(self.stage)
+
+        # Try to replace with a different valid squad.
+        _, other_squad = self._make_valid_squad(team=self.away)
+        with self.assertRaises(FantasyError):
+            set_squad(
+                fantasy_team=self.team,
+                stage=self.stage,
+                selections=other_squad,
+            )
+
+        after = set(
+            self.team.selections.filter(stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(before, after)
