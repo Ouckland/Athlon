@@ -1,8 +1,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Competition, Organization, Player, Team
-
+from .models import Competition, Organization, Player, Season, Stage, Team
 User = get_user_model()
 
 
@@ -55,7 +54,6 @@ class OrganizationSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ("id", "slug", "created_at", "updated_at")
 
-
 class CompetitionSerializer(serializers.ModelSerializer):
     organization = OrganizationBriefSerializer(read_only=True)
     organization_id = serializers.PrimaryKeyRelatedField(
@@ -73,6 +71,7 @@ class CompetitionSerializer(serializers.ModelSerializer):
             "name",
             "slug",
             "description",
+            "type",           # new
             "season",
             "status",
             "start_date",
@@ -82,6 +81,83 @@ class CompetitionSerializer(serializers.ModelSerializer):
         )
         read_only_fields = ("id", "slug", "created_at", "updated_at")
 
+class SeasonBriefSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Season
+        fields = ("id", "name", "slug", "status")
+
+
+class StageBriefSerializer(serializers.ModelSerializer):
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+
+    class Meta:
+        model = Stage
+        fields = ("id", "kind", "kind_display", "number", "name")
+
+
+class SeasonSerializer(serializers.ModelSerializer):
+    competition = CompetitionBriefSerializer(read_only=True)
+
+    class Meta:
+        model = Season
+        fields = (
+            "id",
+            "competition",
+            "name",
+            "slug",
+            "status",
+            "start_date",
+            "end_date",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+
+class SeasonCreateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=100)
+    status = serializers.ChoiceField(
+        choices=Season.Status.choices, required=False, default=Season.Status.DRAFT
+    )
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        start = attrs.get("start_date")
+        end = attrs.get("end_date")
+        if start and end and start > end:
+            raise serializers.ValidationError(
+                {"end_date": "Season end date must be on or after start date."}
+            )
+        return attrs
+
+
+class StageSerializer(serializers.ModelSerializer):
+    season = SeasonBriefSerializer(read_only=True)
+
+    class Meta:
+        model = Stage
+        fields = (
+            "id",
+            "season",
+            "kind",
+            "number",
+            "name",
+            "start_date",
+            "end_date",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+
+class StageCreateSerializer(serializers.Serializer):
+    kind = serializers.ChoiceField(choices=Stage.Kind.choices)
+    number = serializers.IntegerField(min_value=1)
+    name = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    start_date = serializers.DateField(required=False, allow_null=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
+    
 
 class TeamSerializer(serializers.ModelSerializer):
     organization = OrganizationBriefSerializer(read_only=True)
@@ -186,3 +262,9 @@ class PlayerSerializer(serializers.ModelSerializer):
         if value < 1 or value > 99:
             raise serializers.ValidationError("Shirt number must be between 1 and 99.")
         return value
+
+class CompetitionTeamWriteSerializer(serializers.Serializer):
+    team_id = serializers.PrimaryKeyRelatedField(
+        queryset=Team.objects.all(),
+        source="team",
+    )

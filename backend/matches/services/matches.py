@@ -3,7 +3,13 @@ from django.db import transaction
 from django.utils import timezone
 
 from matches.models import Match, MatchEvent
- 
+
+from matches.services.lineup import (
+    close_lineup_at_fulltime,
+    get_player_minutes,
+    record_substitution_in_lineup,
+    submit_lineup,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -55,15 +61,7 @@ def _validate_lifecycle(*, match, event_type):
 # ---------------------------------------------------------------------------
 # Creation
 # ---------------------------------------------------------------------------
-def create_match(*, competition, home_team, away_team, kickoff_at=None):
-    """
-    Create a scheduled Match.
-
-    Rules:
-      - home and away must be different teams
-      - both teams must belong to the competition's organization
-      - both teams must be registered in the competition (Team.competitions M2M)
-    """
+def create_match(*, competition, home_team, away_team, kickoff_at=None, stage=None):
     if home_team.id == away_team.id:
         raise MatchError("Home and away teams must be different.")
 
@@ -78,11 +76,20 @@ def create_match(*, competition, home_team, away_team, kickoff_at=None):
     if away_team.id not in registered_team_ids:
         raise MatchError("Away team is not registered in this competition.")
 
+    if stage is not None:
+        if stage.season.competition_id != competition.id:
+            raise MatchError("Stage does not belong to this competition.")
+        if competition.type == competition.Type.LEAGUE and stage.kind != stage.Kind.GAMEWEEK:
+            raise MatchError("League matches must belong to a GAMEWEEK stage.")
+        if competition.type == competition.Type.CUP and stage.kind != stage.Kind.ROUND:
+            raise MatchError("Cup matches must belong to a ROUND stage.")
+
     return Match.objects.create(
         competition=competition,
         home_team=home_team,
         away_team=away_team,
         kickoff_at=kickoff_at,
+        stage=stage,
     )
 
 
@@ -194,7 +201,21 @@ def record_match_event(
             _recalculate_score(match)
 
         _apply_event_to_match(match, event)
-    
+
+        if event_type == MatchEvent.Type.SUBSTITUTION:
+            try:
+                record_substitution_in_lineup(
+                    match=match,
+                    player_off=player,
+                    player_on=related_player,
+                    minute=minute,
+                )
+            except ValueError as exc:
+                raise MatchError(str(exc))
+
+        if event_type == MatchEvent.Type.FULLTIME:
+            close_lineup_at_fulltime(match, minute)
+
     # Broadcast only after the DB transaction that wraps this call commits.
     # If an outer transaction rolls back, this callback never fires.
     transaction.on_commit(lambda: _post_commit_side_effects(event))
@@ -225,21 +246,39 @@ def _validate_event(*, match, event_type, minute, team, player, related_player):
         if team is None:
             raise MatchError(f"{event_type} events require a team.")
 
-    if event_type == MatchEvent.Type.SUBSTITUTION:
-        if team is None:
-            raise MatchError("Substitution requires a team.")
-        if player is None:
-            raise MatchError("Substitution requires the player going off.")
-        if related_player is None:
-            raise MatchError("Substitution requires the player coming on.")
-        if related_player.team_id != team.id:
-            raise MatchError("Player coming on must belong to the event team.")
-        if related_player.id == player.id:
-            raise MatchError("A player cannot substitute themselves.")
+        if event_type == MatchEvent.Type.SUBSTITUTION:
+            if team is None:
+                raise MatchError("Substitution requires a team.")
+            if player is None:
+                raise MatchError("Substitution requires the player going off.")
+            if related_player is None:
+                raise MatchError("Substitution requires the player coming on.")
+            if related_player.team_id != team.id:
+                raise MatchError("Player coming on must belong to the event team.")
+            if related_player.id == player.id:
+                raise MatchError("A player cannot substitute themselves.")
 
-    # related_player only makes sense for substitutions.
-    if related_player is not None and event_type != MatchEvent.Type.SUBSTITUTION:
-        raise MatchError("Only substitution events can have a related player.")
+            # Both players must be in the submitted lineup for this team's match.
+            from matches.models import MatchLineup
+            if not MatchLineup.objects.filter(match=match, player=player).exists():
+                raise MatchError("Player coming off is not in the submitted lineup.")
+            if not MatchLineup.objects.filter(match=match, player=related_player).exists():
+                raise MatchError("Player coming on is not in the submitted lineup.")
+
+    # Goal-specific rules: related_player = assister (nullable).
+    if event_type == MatchEvent.Type.GOAL and related_player is not None:
+        if team is None:
+            raise MatchError("Goal with an assist requires a team.")
+        if related_player.team_id != team.id:
+            raise MatchError("Assister must belong to the scoring team.")
+        if player is not None and related_player.id == player.id:
+            raise MatchError("Scorer cannot assist their own goal.")
+
+    # related_player is only meaningful for SUBSTITUTION and GOAL.
+    if related_player is not None and event_type not in (
+        MatchEvent.Type.SUBSTITUTION,
+        MatchEvent.Type.GOAL,):
+        raise MatchError("Only substitution and goal events can have a related player.")
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +329,5 @@ def _apply_event_to_match(match, event):
     for field, value in updates.items():
         setattr(match, field, value)
     match.save(update_fields=list(updates.keys()) + ["updated_at"])
+
+

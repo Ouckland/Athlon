@@ -5,22 +5,33 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
 
-from .models import Competition, Organization, Player, Team
+from .models import Competition, Organization, Player, Season, Stage, Team
 from .serializers import (
     CompetitionSerializer,
     OrganizationSerializer,
     PlayerSerializer,
+    SeasonCreateSerializer,
+    SeasonSerializer,
+    StageCreateSerializer,
+    StageSerializer,
     TeamSerializer,
+    TeamBriefSerializer,
+    CompetitionTeamWriteSerializer,
 )
 from .services import (
     LeagueError,
     add_player_to_team,
     create_competition,
     create_organization,
+    create_stage,
     create_team,
     set_team_captain,
-    set_team_competitions
+    set_team_competitions,
+    create_season,
+    add_team_to_competition,
+    remove_team_from_competition,
 )
+from .permissions import IsAdminOrReadOnly
 
 
 # ---------------------------------------------------------------------------
@@ -181,3 +192,119 @@ def players_view(request):
 def player_detail_view(request, pk):
     player = get_object_or_404(Player.objects.select_related("team"), pk=pk)
     return Response(PlayerSerializer(player).data)
+
+
+# ---------------------------------------------------------------------------
+# Seasons
+# ---------------------------------------------------------------------------
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticatedOrReadOnly])
+def competition_seasons_view(request, competition_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+
+    if request.method == "GET":
+        qs = competition.seasons.all()
+        return Response(SeasonSerializer(qs, many=True).data)
+
+    serializer = SeasonCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+    try:
+        season = create_season(
+            competition=competition,
+            name=data["name"],
+            status=data.get("status", Season.Status.DRAFT),
+            start_date=data.get("start_date"),
+            end_date=data.get("end_date"),
+        )
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        SeasonSerializer(season).data, status=status.HTTP_201_CREATED
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def season_detail_view(request, pk):
+    season = get_object_or_404(
+        Season.objects.select_related("competition"), pk=pk
+    )
+    return Response(SeasonSerializer(season).data)
+
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticatedOrReadOnly])
+def season_stages_view(request, season_id):
+    season = get_object_or_404(
+        Season.objects.select_related("competition"), pk=season_id
+    )
+
+    if request.method == "GET":
+        qs = season.stages.all()
+        return Response(StageSerializer(qs, many=True).data)
+
+    serializer = StageCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+    try:
+        stage = create_stage(
+            season=season,
+            kind=data["kind"],
+            number=data["number"],
+            name=data.get("name", ""),
+            start_date=data.get("start_date"),
+            end_date=data.get("end_date"),
+        )
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        StageSerializer(stage).data, status=status.HTTP_201_CREATED
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def stage_detail_view(request, pk):
+    stage = get_object_or_404(
+        Stage.objects.select_related("season", "season__competition"), pk=pk
+    )
+    return Response(StageSerializer(stage).data)
+
+# ---------------------------------------------------------------------------
+# Competition participation
+# ---------------------------------------------------------------------------
+@api_view(["GET", "POST"])
+@permission_classes([IsAdminOrReadOnly])
+def competition_teams_view(request, competition_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+
+    if request.method == "GET":
+        qs = competition.teams.all().order_by("name")
+        return Response(TeamBriefSerializer(qs, many=True).data)
+
+    serializer = CompetitionTeamWriteSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    team = serializer.validated_data["team"]
+    try:
+        add_team_to_competition(competition=competition, team=team)
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(
+        TeamBriefSerializer(team).data, status=status.HTTP_201_CREATED
+    )
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAdminOrReadOnly])
+def competition_team_detail_view(request, competition_id, team_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+    team = get_object_or_404(Team, pk=team_id)
+    try:
+        remove_team_from_competition(competition=competition, team=team)
+    except LeagueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(status=status.HTTP_204_NO_CONTENT)

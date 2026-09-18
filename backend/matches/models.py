@@ -23,6 +23,15 @@ class Match(models.Model):
     competition = models.ForeignKey(
         Competition, on_delete=models.CASCADE, related_name="matches"
     )
+
+    stage = models.ForeignKey(
+        "league.Stage",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="matches",
+    )
+
     home_team = models.ForeignKey(
         Team, on_delete=models.CASCADE, related_name="home_matches"
     )
@@ -55,6 +64,7 @@ class Match(models.Model):
         indexes = [
             models.Index(fields=["competition", "status"]),
             models.Index(fields=["kickoff_at"]),
+            models.Index(fields=["stage"]),
         ]
 
     def __str__(self):
@@ -118,3 +128,47 @@ class MatchEvent(models.Model):
 
     def __str__(self):
         return f"{self.get_type_display()} @ {self.minute}' — {self.match}"
+
+class MatchLineup(models.Model):
+    """
+    A player's appearance in a match. Rows are created in bulk by
+    submit_lineup() BEFORE the match starts, and mutated in place as
+    substitutions and full-time are recorded.
+
+    - is_starter=True  -> player was in the starting XI
+    - is_starter=False -> player was on the bench (bench_order set)
+    - subbed_on_minute is only meaningful for bench players who entered
+    - subbed_off_minute is closed at full-time for active players
+    """
+
+    match = models.ForeignKey(
+        Match, on_delete=models.CASCADE, related_name="lineup_entries"
+    )
+    team = models.ForeignKey(
+        "league.Team", on_delete=models.CASCADE, related_name="match_lineups"
+    )
+    player = models.ForeignKey(
+        "league.Player", on_delete=models.CASCADE, related_name="match_lineups"
+    )
+    is_starter = models.BooleanField(default=False)
+    bench_order = models.PositiveSmallIntegerField(null=True, blank=True)
+    subbed_on_minute = models.PositiveSmallIntegerField(null=True, blank=True)
+    subbed_off_minute = models.PositiveSmallIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["match", "player"],
+                name="uniq_lineup_entry_per_match_player",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["match", "team"]),
+            models.Index(fields=["match", "is_starter"]),
+        ]
+
+    def __str__(self):
+        role = "XI" if self.is_starter else "BENCH"
+        return f"{role} {self.player} @ {self.match}"

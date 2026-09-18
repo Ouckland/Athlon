@@ -51,11 +51,10 @@ class FantasyPlayerSelectionSerializer(serializers.ModelSerializer):
         model = FantasyPlayerSelection
         fields = ("id", "player", "is_starter", "is_captain")
 
-
 class FantasyTeamSerializer(serializers.ModelSerializer):
-    starters = serializers.SerializerMethodField()
-    bench = serializers.SerializerMethodField()
-    captain_id = serializers.SerializerMethodField()
+    from matches.serializers import CompetitionBriefSerializer, SeasonBriefSerializer
+    competition = CompetitionBriefSerializer(read_only=True)
+    season = SeasonBriefSerializer(read_only=True)
     total_points = serializers.SerializerMethodField()
 
     class Meta:
@@ -63,44 +62,21 @@ class FantasyTeamSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "name",
+            "competition",
+            "season",
+            "total_points",
             "created_at",
             "updated_at",
-            "starters",
-            "bench",
-            "captain_id",
-            "total_points",
         )
 
-    def _selections(self, obj):
-        # Uses the prefetch when available; falls back cleanly otherwise.
-        return list(obj.selections.all())
-
-    def get_starters(self, obj):
-        return FantasyPlayerSelectionSerializer(
-            [s for s in self._selections(obj) if s.is_starter], many=True
-        ).data
-
-    def get_bench(self, obj):
-        return FantasyPlayerSelectionSerializer(
-            [s for s in self._selections(obj) if not s.is_starter], many=True
-        ).data
-
-    def get_captain_id(self, obj):
-        for s in self._selections(obj):
-            if s.is_captain:
-                return s.player_id
-        return None
-
     def get_total_points(self, obj):
-        # Local import keeps serializers free of a hard import on the
-        # leaderboard module at import time.
         from .services import fantasy_team_total_points
         return fantasy_team_total_points(obj)
 
-
 class FantasyTeamWriteSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100)
-
+    competition_id = serializers.IntegerField()
+    season_id = serializers.IntegerField()
 
 # ---------------------------------------------------------------------------
 # Squad input
@@ -120,19 +96,23 @@ class SquadWriteSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 class FantasyGroupMemberSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source="user.id", read_only=True)
-    email = serializers.EmailField(source="user.email", read_only=True)
+    display_name = serializers.SerializerMethodField()
     joined_at = serializers.DateTimeField(source="created_at", read_only=True)
 
     class Meta:
         model = FantasyGroupMembership
-        fields = ("user_id", "email", "joined_at")
+        fields = ("user_id", "display_name", "joined_at")
+
+    def get_display_name(self, obj):
+        return obj.user.display_name or obj.user.get_full_name() or f"User #{obj.user_id}"
 
 
 class FantasyGroupSerializer(serializers.ModelSerializer):
     owner_email = serializers.EmailField(source="owner.email", read_only=True)
     member_count = serializers.SerializerMethodField()
     members = serializers.SerializerMethodField()
-
+    owner_id = serializers.IntegerField(source="owner.id", read_only=True)
+    owner_display_name = serializers.SerializerMethodField()
     class Meta:
         model = FantasyGroup
         fields = (
@@ -145,6 +125,10 @@ class FantasyGroupSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         )
+
+
+    def get_owner_display_name(self, obj):
+        return obj.owner.display_name or obj.owner.get_full_name() or f"User #{obj.owner_id}"
 
     def get_member_count(self, obj):
         return obj.memberships.count()
@@ -169,5 +153,6 @@ class LeaderboardRowSerializer(serializers.Serializer):
     rank = serializers.IntegerField()
     fantasy_team_id = serializers.IntegerField()
     name = serializers.CharField()
-    owner_email = serializers.EmailField()
+    owner_id = serializers.IntegerField()
+    owner_display_name = serializers.CharField()
     total_points = serializers.IntegerField()

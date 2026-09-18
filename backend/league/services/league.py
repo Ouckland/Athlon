@@ -1,7 +1,7 @@
+from django.db import IntegrityError
 from django.utils.text import slugify
 
-from league.models import Competition, Organization, Player, Team
-
+from league.models import Competition, Organization, Player, Season, Stage, Team
 
 class LeagueError(Exception):
     """Raised when a league domain rule is violated."""
@@ -139,3 +139,132 @@ def set_team_competitions(*, team, competitions):
         )
     team.competitions.set(comps)
     return team
+
+
+def _unique_season_slug(competition, base_slug, max_length=120):
+    """Slug unique within a competition's seasons."""
+    base_slug = (base_slug or "season")[:max_length]
+    candidate = base_slug
+    i = 2
+    while Season.objects.filter(competition=competition, slug=candidate).exists():
+        suffix = f"-{i}"
+        candidate = f"{base_slug[: max_length - len(suffix)]}{suffix}"
+        i += 1
+    return candidate
+
+
+def create_season(
+    *,
+    competition,
+    name,
+    slug=None,
+    status=Season.Status.DRAFT,
+    start_date=None,
+    end_date=None,
+):
+    if not name or not name.strip():
+        raise LeagueError("Season name is required.")
+    if status not in Season.Status.values:
+        raise LeagueError("Invalid season status.")
+    if start_date and end_date and start_date > end_date:
+        raise LeagueError("Season end date must be on or after start date.")
+
+    return Season.objects.create(
+        competition=competition,
+        name=name.strip(),
+        slug=_unique_season_slug(competition, slug or slugify(name)),
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def create_stage(
+    *,
+    season,
+    kind,
+    number,
+    name="",
+    start_date=None,
+    end_date=None,
+):
+    if kind not in Stage.Kind.values:
+        raise LeagueError("Invalid stage kind.")
+    if number is None or number < 1:
+        raise LeagueError("Stage number must be a positive integer.")
+    if start_date and end_date and start_date > end_date:
+        raise LeagueError("Stage end date must be on or after start date.")
+
+    competition_type = season.competition.type
+    if competition_type == Competition.Type.LEAGUE and kind != Stage.Kind.GAMEWEEK:
+        raise LeagueError("League competitions accept only GAMEWEEK stages.")
+    if competition_type == Competition.Type.CUP and kind != Stage.Kind.ROUND:
+        raise LeagueError("Cup competitions accept only ROUND stages.")
+
+    # Pre-check for a clean error; DB constraint still protects against races.
+    if Stage.objects.filter(season=season, number=number).exists():
+        raise LeagueError(
+            "A stage with that number already exists in this season."
+        )
+
+    try:
+        return Stage.objects.create(
+            season=season,
+            kind=kind,
+            number=number,
+            name=name or "",
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except IntegrityError as exc:
+        raise LeagueError(
+            "A stage with that number already exists in this season."
+        ) from exc
+
+
+def add_team_to_competition(*, competition, team):
+    """
+    Add a team to a competition's participating teams.
+
+    Rules:
+      - Team must belong to the same organization as the competition.
+      - Idempotent: re-adding an already-participating team is a no-op.
+    """
+    if team.organization_id != competition.organization_id:
+        raise LeagueError(
+            "Team organization must match the competition's organization."
+        )
+    if not competition.teams.filter(id=team.id).exists():
+        competition.teams.add(team)
+    return team
+
+
+def remove_team_from_competition(*, competition, team):
+    """
+    Remove a team from a competition's participating teams.
+
+    Rejects removal if:
+      - the team is not currently participating, or
+      - the team has any match in this competition (removing participation
+        while matches still reference the team would leave the competition
+        in an inconsistent state — the lineup and match APIs assume a match's
+        teams are participating in the match's competition).
+    """
+    if not competition.teams.filter(id=team.id).exists():
+        raise LeagueError("Team is not participating in this competition.")
+
+    # Runtime import to preserve the dependency direction (league -> matches
+    # is allowed at runtime; a module-level import would create a cycle since
+    # matches.models imports league.models).
+    from django.db.models import Q
+    from matches.models import Match
+
+    if Match.objects.filter(competition=competition).filter(
+        Q(home_team=team) | Q(away_team=team)
+    ).exists():
+        raise LeagueError(
+            "Cannot remove a team that has matches in this competition."
+        )
+
+    competition.teams.remove(team)
+

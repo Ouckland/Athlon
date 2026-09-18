@@ -1,8 +1,8 @@
 from rest_framework import serializers
 
-from league.models import Competition, Player, Team
+from league.models import Competition, Player, Stage, Team, Season
 
-from .models import Match, MatchEvent
+from .models import Match, MatchEvent, MatchLineup
 from .services import MAX_MINUTE, MIN_MINUTE
 
 
@@ -19,7 +19,10 @@ class CompetitionBriefSerializer(serializers.ModelSerializer):
     class Meta:
         model = Competition
         fields = ("id", "name", "slug")
-
+class SeasonBriefSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Season
+        fields = ("id", "name", "slug", "status", "start_date", "end_date")
 
 class PlayerBriefSerializer(serializers.ModelSerializer):
     display_name = serializers.SerializerMethodField()
@@ -31,6 +34,13 @@ class PlayerBriefSerializer(serializers.ModelSerializer):
     def get_display_name(self, obj):
         return str(obj)
 
+class StageBriefSerializer(serializers.ModelSerializer):
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+
+    class Meta:
+        model = Stage
+        fields = ("id", "kind", "kind_display", "number", "name")
+
 
 # ---------------------------------------------------------------------------
 # Match — output
@@ -39,6 +49,7 @@ class MatchSerializer(serializers.ModelSerializer):
     competition = CompetitionBriefSerializer(read_only=True)
     home_team = TeamBriefSerializer(read_only=True)
     away_team = TeamBriefSerializer(read_only=True)
+    stage = StageBriefSerializer(read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
@@ -48,6 +59,7 @@ class MatchSerializer(serializers.ModelSerializer):
             "competition",
             "home_team",
             "away_team",
+            "stage",            # new
             "status",
             "status_display",
             "kickoff_at",
@@ -75,8 +87,13 @@ class MatchCreateSerializer(serializers.Serializer):
     away_team_id = serializers.PrimaryKeyRelatedField(
         queryset=Team.objects.all(), source="away_team"
     )
+    stage_id = serializers.PrimaryKeyRelatedField(
+        queryset=Stage.objects.all(),
+        source="stage",
+        required=False,
+        allow_null=True,
+    )
     kickoff_at = serializers.DateTimeField(required=False, allow_null=True)
-
 
 # ---------------------------------------------------------------------------
 # MatchEvent — output
@@ -135,4 +152,28 @@ class MatchEventCreateSerializer(serializers.Serializer):
     )
     description = serializers.CharField(
         required=False, allow_blank=True, max_length=255
+    )
+
+class LineupEntrySerializer(serializers.ModelSerializer):
+    player = PlayerBriefSerializer(read_only=True)
+    team_id = serializers.IntegerField(source="team.id", read_only=True)
+
+    class Meta:
+        model = MatchLineup
+        fields = (
+            "id",
+            "player",
+            "team_id",
+            "is_starter",
+            "bench_order",
+            "subbed_on_minute",
+            "subbed_off_minute",
+        )
+
+
+class LineupSubmitSerializer(serializers.Serializer):
+    team_id = serializers.IntegerField()
+    starters = serializers.ListField(child=serializers.IntegerField(), min_length=1)
+    bench = serializers.ListField(
+        child=serializers.IntegerField(), min_length=0, required=False, default=list
     )

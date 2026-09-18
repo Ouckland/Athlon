@@ -6,14 +6,16 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .permissions import IsScoutOrAdminOrReadOnly
-from .models import Match
+from .models import Match, MatchLineup
 from .serializers import (
     MatchCreateSerializer,
     MatchEventCreateSerializer,
     MatchEventSerializer,
     MatchSerializer,
+    LineupEntrySerializer,
+    LineupSubmitSerializer
 )
-from .services import MatchError, create_match, record_match_event
+from .services import MatchError, create_match, record_match_event, submit_lineup
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ def matches_list_create_view(request):
             home_team=data["home_team"],
             away_team=data["away_team"],
             kickoff_at=data.get("kickoff_at"),
+            stage=data.get("stage"),
         )
     except MatchError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -119,3 +122,51 @@ def match_events_view(request, pk):
         },
         status=status.HTTP_201_CREATED,
     )
+
+@api_view(["GET", "PUT"])
+@permission_classes([IsScoutOrAdminOrReadOnly])
+def match_lineup_view(request, pk, team_id):
+    match = get_object_or_404(Match, pk=pk)
+
+    if request.method == "GET":
+        rows = (
+            MatchLineup.objects
+            .filter(match=match, team_id=team_id)
+            .select_related("player", "team")
+            .order_by("-is_starter", "bench_order", "player__last_name")
+        )
+        return Response(LineupEntrySerializer(rows, many=True).data)
+
+    serializer = LineupSubmitSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    from league.models import Player, Team
+    team = get_object_or_404(Team, pk=data["team_id"])
+    if team.id != int(team_id):
+        return Response(
+            {"detail": "team_id in body must match URL."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    starters = list(Player.objects.filter(id__in=data["starters"]))
+    bench = list(Player.objects.filter(id__in=data.get("bench", [])))
+
+    if len(starters) != len(data["starters"]) or len(bench) != len(data.get("bench", [])):
+        return Response(
+            {"detail": "One or more player IDs do not exist."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        submit_lineup(match=match, team=team, starters=starters, bench=bench)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    rows = (
+        MatchLineup.objects
+        .filter(match=match, team=team)
+        .select_related("player", "team")
+        .order_by("-is_starter", "bench_order", "player__last_name")
+    )
+    return Response(LineupEntrySerializer(rows, many=True).data)
