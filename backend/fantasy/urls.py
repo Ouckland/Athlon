@@ -7,10 +7,15 @@ app_name = "fantasy"
 urlpatterns = [
     path("teams/", views.teams_view, name="team-list"),
     path("teams/<int:team_id>/", views.team_detail_view, name="team-detail"),
-    path(
+        path(
         "teams/<int:team_id>/squads/<int:stage_id>/",
         views.team_squad_view,
         name="team-squad",
+    ),
+    path(
+        "teams/<int:team_id>/starting-squads/<int:stage_id>/",
+        views.team_starting_squad_view,
+        name="team-starting-squad",
     ),
     path("groups/", views.groups_view, name="group-list"),
     path("groups/join/", views.join_group_view, name="group-join"),

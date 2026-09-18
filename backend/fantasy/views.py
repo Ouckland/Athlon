@@ -32,7 +32,7 @@ from .services import (
     leave_group,
     remove_group_member,
     season_leaderboard,
-    set_squad,
+    create_starting_squad,
     stage_leaderboard,
     is_gameweek_locked,
     validate_stage_for_fantasy,
@@ -183,32 +183,49 @@ def team_detail_view(request, team_id):
 # ---------------------------------------------------------------------------
 # Squad (per stage)
 # ---------------------------------------------------------------------------
-@api_view(["GET", "PUT"])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def team_squad_view(request, team_id, stage_id):
     team = _my_team_or_404(request, team_id)
-    stage = get_object_or_404(Stage.objects.select_related("season"), pk=stage_id)
+    stage = get_object_or_404(
+        Stage.objects.select_related("season"), pk=stage_id
+    )
 
-    # Stage validation applies to both reads and writes.
     try:
         validate_stage_for_fantasy(fantasy_team=team, stage=stage)
     except FantasyError as exc:
-        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+        )
 
-    if request.method == "GET":
-        return Response(_serialize_squad(team, stage))
+    return Response(_serialize_squad(team, stage))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def team_starting_squad_view(request, team_id, stage_id):
+    team = _my_team_or_404(request, team_id)
+    stage = get_object_or_404(
+        Stage.objects.select_related("season"), pk=stage_id
+    )
 
     serializer = SquadWriteSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+
     try:
-        set_squad(
+        create_starting_squad(
             fantasy_team=team,
             stage=stage,
             selections=serializer.validated_data["selections"],
         )
     except FantasyError as exc:
-        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-    return Response(_serialize_squad(team, stage))
+        return Response(
+            {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    return Response(
+        _serialize_squad(team, stage), status=status.HTTP_201_CREATED
+    )
 
 
 # ---------------------------------------------------------------------------
