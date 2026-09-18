@@ -50,3 +50,25 @@ def join_group(*, user, invite_code):
         raise FantasyError("User is already a member of this group.")
 
     return FantasyGroupMembership.objects.create(group=group, user=user)
+
+def leave_group(*, user, group):
+    membership = FantasyGroupMembership.objects.filter(
+        group=group, user=user
+    ).first()
+    if membership is None:
+        raise FantasyError("You are not a member of this group.")
+    if group.owner_id == user.id:
+        raise FantasyError("Group owner cannot leave. Transfer ownership first.")
+    membership.delete()
+
+
+def remove_group_member(*, owner, group, member_user):
+    if group.owner_id != owner.id:
+        raise FantasyError("Only the group owner can remove members.")
+    if member_user.id == owner.id:
+        raise FantasyError("Owner cannot remove themselves.")
+    deleted, _ = FantasyGroupMembership.objects.filter(
+        group=group, user=member_user
+    ).delete()
+    if not deleted:
+        raise FantasyError("User is not a member of this group.")

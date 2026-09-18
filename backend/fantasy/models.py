@@ -3,29 +3,53 @@ from django.db import models
 
 
 class FantasyTeam(models.Model):
-    """A user's fantasy team. One per user for the MVP."""
+    """
+    A user's fantasy participation in one (competition, season).
 
-    user = models.OneToOneField(
+    A user may have many fantasy teams — one per competition/season pair.
+    """
+
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="fantasy_team",
+        related_name="fantasy_teams",
+    )
+    competition = models.ForeignKey(
+        "league.Competition",
+        on_delete=models.CASCADE,
+        related_name="fantasy_teams",
+    )
+    season = models.ForeignKey(
+        "league.Season",
+        on_delete=models.CASCADE,
+        related_name="fantasy_teams",
     )
     name = models.CharField(max_length=100)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __str__(self):
-        return f"{self.name} ({self.user.email})"
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "competition", "season"],
+                name="uniq_fantasy_team_per_user_comp_season",
+            ),
+        ]
 
+    def __str__(self):
+        return f"{self.name} ({self.user.email} · {self.competition.name} {self.season.name})"
 
 class FantasyPlayerSelection(models.Model):
-    """
-    A single player selected by a fantasy team.
-    Position is NOT stored here — it comes from league.Player.position.
-    """
-
     fantasy_team = models.ForeignKey(
         FantasyTeam, on_delete=models.CASCADE, related_name="selections"
+    )
+    stage = models.ForeignKey(
+        "league.Stage",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="fantasy_selections",
     )
     player = models.ForeignKey(
         "league.Player",
@@ -39,18 +63,18 @@ class FantasyPlayerSelection(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["fantasy_team", "player"],
-                name="uniq_player_per_fantasy_team",
+                fields=["fantasy_team", "stage", "player"],
+                name="uniq_player_per_team_stage",
             ),
         ]
         indexes = [
-            models.Index(fields=["fantasy_team", "is_starter"]),
-            models.Index(fields=["fantasy_team", "is_captain"]),
+            models.Index(fields=["fantasy_team", "stage", "is_starter"]),
+            models.Index(fields=["fantasy_team", "stage", "is_captain"]),
         ]
 
     def __str__(self):
         role = "C" if self.is_captain else ("S" if self.is_starter else "B")
-        return f"{self.player} [{role}]"
+        return f"{self.player} [{role}] stage={self.stage_id}"
 
 
 class FantasyGroup(models.Model):

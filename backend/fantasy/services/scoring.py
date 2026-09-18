@@ -1,18 +1,10 @@
 from django.db.models import Q
 
 from league.models import Player
-from matches.models import Match, MatchEvent
-
+from matches.models import Match, MatchEvent, MatchLineup
 from fantasy.models import FantasyPoints
 
 
-# ---------------------------------------------------------------------------
-# Scoring configuration
-# ---------------------------------------------------------------------------
-# NOTE: "assist" is listed for documentation/future use. It CANNOT currently
-# be awarded — the MatchEvent model does not carry assist information.
-# Do not remove this entry; when the assist rule becomes calculable, the
-# scoring code below just needs to look up SCORING_RULES["assist"].
 SCORING_RULES = {
     "appearance": 1,
     "minutes_60_plus": 1,
@@ -20,16 +12,15 @@ SCORING_RULES = {
     "goal_DEF": 6,
     "goal_MID": 5,
     "goal_ATT": 4,
-    "assist": 3,         # UNSUPPORTED — see module docstring above
+    "assist": 3,
     "clean_sheet": 4,
     "yellow_card": -1,
     "red_card": -3,
 }
 
-# Captain multiplier is applied at the fantasy-team aggregation layer, NOT
-# inside score_player_for_match() — the same player can be captain on one
-# fantasy team and a normal starter on another.
 CAPTAIN_MULTIPLIER = 2
+
+CLEAN_SHEET_MIN_MINUTES = 60
 
 
 # ---------------------------------------------------------------------------
@@ -37,94 +28,84 @@ CAPTAIN_MULTIPLIER = 2
 # ---------------------------------------------------------------------------
 def score_player_for_match(player, match):
     """
-    Deterministic: given the same MatchEvent rows for `match`, returns the
-    same (points, breakdown) tuple every call. Pure function of DB state.
-
-    A player with no events returns (0, {}).
+    Deterministic. Returns (points, breakdown).
+    Assists are attributed via GOAL events where related_player == player.
+    Minutes come from matches.services.lineup.get_player_minutes().
     """
+    from matches.services.lineup import get_player_minutes
+
     events = list(
         MatchEvent.objects.filter(match=match)
         .filter(Q(player=player) | Q(related_player=player))
         .order_by("minute", "created_at")
     )
 
-    if not events:
+    minutes = get_player_minutes(player, match)
+    if minutes <= 0:
         return 0, {}
 
-    breakdown = {}
+    breakdown = {"appearance": SCORING_RULES["appearance"]}
 
-    # Appearance — any event at all implies the player was involved.
-    breakdown["appearance"] = SCORING_RULES["appearance"]
+    if minutes >= 60:
+        breakdown["minutes_60_plus"] = SCORING_RULES["minutes_60_plus"]
 
-    # Goals — position drives the value.
+    # Goals — only events where this player is the scorer.
     goal_count = sum(
         1
         for e in events
         if e.type == MatchEvent.Type.GOAL and e.player_id == player.id
     )
     if goal_count:
-        key = f"goal_{player.position}"
-        per_goal = SCORING_RULES.get(key, 0)
-        breakdown["goals"] = goal_count * per_goal
+        breakdown["goals"] = goal_count * SCORING_RULES.get(
+            f"goal_{player.position}", 0
+        )
+
+    # Assists — GOAL events where this player is the related_player.
+    assist_count = sum(
+        1
+        for e in events
+        if e.type == MatchEvent.Type.GOAL and e.related_player_id == player.id
+    )
+    if assist_count:
+        breakdown["assists"] = assist_count * SCORING_RULES["assist"]
 
     # Cards.
     yellow_count = sum(
-        1
-        for e in events
+        1 for e in events
         if e.type == MatchEvent.Type.YELLOW and e.player_id == player.id
     )
     if yellow_count:
         breakdown["yellow_cards"] = yellow_count * SCORING_RULES["yellow_card"]
 
     red_count = sum(
-        1
-        for e in events
+        1 for e in events
         if e.type == MatchEvent.Type.RED and e.player_id == player.id
     )
     if red_count:
         breakdown["red_cards"] = red_count * SCORING_RULES["red_card"]
 
-    # 60+ minutes — approximated from substitution events.
-    if _played_60_plus(player, events):
-        breakdown["minutes_60_plus"] = SCORING_RULES["minutes_60_plus"]
-
-    # Clean sheet — GK/DEF only, and only when their side conceded 0 goals.
-    if _gets_clean_sheet(player, match):
+    if _gets_clean_sheet(player, match, minutes, events):
         breakdown["clean_sheet"] = SCORING_RULES["clean_sheet"]
 
-    total = sum(breakdown.values())
-    return total, breakdown
+    return sum(breakdown.values()), breakdown
 
 
-def _played_60_plus(player, events):
+def _gets_clean_sheet(player, match, minutes, events):
     """
-    Approximate from SUBSTITUTION events only.
-
-    - Subbed off before minute 60  -> False
-    - Subbed on after minute 30    -> False
-    - Otherwise                    -> True
-
-    A real match lineup is not stored, so this is the best signal available.
-    """
-    for e in events:
-        if e.type != MatchEvent.Type.SUBSTITUTION:
-            continue
-        if e.player_id == player.id and e.minute < 60:
-            return False
-        if e.related_player_id == player.id and e.minute > 30:
-            return False
-    return True
-
-
-def _gets_clean_sheet(player, match):
-    """
-    Clean-sheet points for GK/DEF whose side did not concede.
-
-    MVP approximation: opponent goals are counted from GOAL MatchEvents.
-    A real lineup is not stored, so only players who have at least one event
-    in the match are eligible.
+    A player earns clean-sheet points iff:
+      - position is GK or DEF
+      - played >= CLEAN_SHEET_MIN_MINUTES minutes
+      - was not sent off
+      - their side conceded 0 goals (counted from opponent GOAL events)
     """
     if player.position not in (Player.Position.GK, Player.Position.DEF):
+        return False
+    if minutes < CLEAN_SHEET_MIN_MINUTES:
+        return False
+    if any(
+        e.type == MatchEvent.Type.RED and e.player_id == player.id
+        for e in events
+    ):
         return False
 
     if player.team_id == match.home_team_id:
@@ -135,9 +116,7 @@ def _gets_clean_sheet(player, match):
         return False
 
     opponent_goals = MatchEvent.objects.filter(
-        match=match,
-        type=MatchEvent.Type.GOAL,
-        team_id=opponent_id,
+        match=match, type=MatchEvent.Type.GOAL, team_id=opponent_id
     ).count()
     return opponent_goals == 0
 
@@ -147,23 +126,31 @@ def _gets_clean_sheet(player, match):
 # ---------------------------------------------------------------------------
 def calculate_match_points(match):
     """
-    Create or update FantasyPoints for every player with any MatchEvent in
-    `match`. Idempotent.
-
-    Returns the list of FantasyPoints rows written.
+    Create or update FantasyPoints rows for every participant of the match,
+    where "participants" = union of:
+      - players with any MatchEvent (scorer, card, sub-on/off, etc.)
+      - players in the submitted MatchLineup
+    This ensures a starter who scores no goals still gets appearance points.
     """
-    player_ids = set(
-        MatchEvent.objects.filter(match=match)
-        .values_list("player_id", flat=True)
+    event_player_ids = set(
+        MatchEvent.objects.filter(match=match).values_list("player_id", flat=True)
     )
-    related_ids = set(
-        MatchEvent.objects.filter(match=match)
-        .values_list("related_player_id", flat=True)
+    event_related_ids = set(
+        MatchEvent.objects.filter(match=match).values_list(
+            "related_player_id", flat=True
+        )
     )
-    player_ids = {pid for pid in (player_ids | related_ids) if pid is not None}
+    lineup_ids = set(
+        MatchLineup.objects.filter(match=match).values_list("player_id", flat=True)
+    )
+
+    player_ids = {
+        pid
+        for pid in (event_player_ids | event_related_ids | lineup_ids)
+        if pid is not None
+    }
 
     players = Player.objects.filter(id__in=player_ids)
-
     written = []
     for player in players:
         points, breakdown = score_player_for_match(player, match)
@@ -177,10 +164,5 @@ def calculate_match_points(match):
 
 
 def recalculate_match_points(match):
-    """
-    Wipe and re-derive all FantasyPoints for a match. Same result as
-    calculate_match_points() but guarantees no stale rows remain (e.g. after
-    a MatchEvent was deleted).
-    """
     FantasyPoints.objects.filter(match=match).delete()
     return calculate_match_points(match)

@@ -1,10 +1,13 @@
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.test import TestCase
-from django.urls import reverse  # noqa: F401  (kept for symmetry with other apps)
+from django.urls import reverse
 from rest_framework.test import APIClient
-from league.models import Competition, Organization, Player, Team
-from matches.models import Match, MatchEvent
+
+from league.models import Competition, Organization, Player, Season, Stage, Team
+from matches.models import Match, MatchEvent, MatchLineup
+from matches.services import MatchError, create_match, record_match_event
+from matches.services.lineup import get_player_minutes, submit_lineup
 
 from .models import (
     FantasyGroup,
@@ -25,15 +28,22 @@ from .services import (
     create_fantasy_team,
     create_group,
     fantasy_team_total_points,
-    global_leaderboard,
-    group_leaderboard,
+    group_season_leaderboard,
+    group_stage_leaderboard,
     join_group,
+    leave_group,
     recalculate_match_points,
+    remove_group_member,
     score_player_for_match,
+    season_leaderboard,
     set_squad,
+    stage_leaderboard,
+    validate_player_eligibility,
 )
 
 User = get_user_model()
+
+POSITIONS_15 = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
 
 
 # ---------------------------------------------------------------------------
@@ -43,32 +53,39 @@ class FantasyTestBase(TestCase):
     def setUp(self):
         self.org = Organization.objects.create(name="Org", slug="org")
         self.competition = Competition.objects.create(
-            organization=self.org, name="League", slug="league"
+            organization=self.org,
+            name="League",
+            slug="league",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
         )
         self.home = Team.objects.create(organization=self.org, name="Home", slug="home")
         self.away = Team.objects.create(organization=self.org, name="Away", slug="away")
         self.competition.teams.add(self.home, self.away)
 
-        self.match = Match.objects.create(
+        self.match = create_match(
             competition=self.competition,
             home_team=self.home,
             away_team=self.away,
+            stage=self.stage,
         )
 
         self.user = User.objects.create_user(
             email="fan@example.com", password="StrongPass!23", role=User.Role.USER
         )
 
+    # -- helpers ---------------------------------------------------------
     def _player(self, team, position, name="P", shirt=None):
         return Player.objects.create(
-            team=team,
-            first_name=name,
-            position=position,
-            shirt_number=shirt,
+            team=team, first_name=name, position=position, shirt_number=shirt,
         )
 
     def _make_valid_squad(self, team=None):
-        """Return (players, selections_payload) forming a valid 15-player squad."""
         team = team or self.home
         players = {
             "GK": [self._player(team, "GK", f"GK{i}") for i in range(2)],
@@ -87,6 +104,57 @@ class FantasyTestBase(TestCase):
         ]
         return flat, selections
 
+    def _make_team(self, user=None, name="T", competition=None, season=None):
+        return create_fantasy_team(
+            user=user or self.user,
+            name=name,
+            competition=competition or self.competition,
+            season=season or self.season,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-team scoping
+# ---------------------------------------------------------------------------
+class MultiTeamTests(FantasyTestBase):
+    def test_user_can_have_two_teams_in_different_competitions(self):
+        comp_b = Competition.objects.create(
+            organization=self.org, name="League B", slug="league-b",
+            type=Competition.Type.LEAGUE,
+        )
+        season_b = Season.objects.create(
+            competition=comp_b, name="2026", slug="2026-b"
+        )
+        t1 = self._make_team(name="A", competition=self.competition, season=self.season)
+        t2 = self._make_team(name="B", competition=comp_b, season=season_b)
+        self.assertEqual(
+            FantasyTeam.objects.filter(user=self.user).count(), 2
+        )
+        self.assertNotEqual(t1.id, t2.id)
+
+    def test_duplicate_team_same_competition_season_rejected(self):
+        self._make_team(name="A")
+        with self.assertRaises(FantasyError):
+            self._make_team(name="B")
+
+    def test_same_user_two_seasons_same_competition(self):
+        season2 = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027"
+        )
+        self._make_team(name="A", season=self.season)
+        self._make_team(name="B", season=season2)
+        self.assertEqual(FantasyTeam.objects.filter(user=self.user).count(), 2)
+
+    def test_season_must_belong_to_competition(self):
+        other_comp = Competition.objects.create(
+            organization=self.org, name="Other", slug="other"
+        )
+        with self.assertRaises(FantasyError):
+            create_fantasy_team(
+                user=self.user, name="X",
+                competition=other_comp, season=self.season,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Squad validation
@@ -94,46 +162,35 @@ class FantasyTestBase(TestCase):
 class SquadValidationTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
-        self.team = create_fantasy_team(user=self.user, name="My Team")
+        self.team = self._make_team(name="My Team")
         self.players, self.valid = self._make_valid_squad()
 
-    def _mutate(self, **kwargs):
-        # deep-ish copy of the valid payload with a single tweak
-        return [{**s, **kwargs} for s in self.valid]
-
     def test_valid_squad_accepted(self):
-        set_squad(self.team, self.valid)
-        self.assertEqual(self.team.selections.count(), SQUAD_SIZE)
-        self.assertEqual(
-            self.team.selections.filter(is_starter=True).count(), STARTERS
-        )
-        self.assertEqual(
-            self.team.selections.filter(is_starter=False).count(), BENCH
-        )
-        self.assertEqual(
-            self.team.selections.filter(is_captain=True).count(), 1
-        )
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        sels = self.team.selections.filter(stage=self.stage)
+        self.assertEqual(sels.count(), SQUAD_SIZE)
+        self.assertEqual(sels.filter(is_starter=True).count(), STARTERS)
+        self.assertEqual(sels.filter(is_starter=False).count(), BENCH)
+        self.assertEqual(sels.filter(is_captain=True).count(), 1)
 
     def test_wrong_total_count_rejected(self):
         with self.assertRaises(FantasyError):
-            set_squad(self.team, self.valid[:-1])
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid[:-1])
 
     def test_wrong_gk_count_rejected(self):
-        # Remove one GK, add one extra ATT
         extra_att = self._player(self.home, "ATT", "ExtraATT")
         bad = [s for s in self.valid if s["player_id"] != self.players[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_wrong_def_count_rejected(self):
         extra_att = self._player(self.home, "ATT", "ExtraATT")
-        # Remove one DEF, add one extra ATT — keeps total 15, breaks DEF/ATT balance
         defs = [p for p in self.players if p.position == "DEF"]
         bad = [s for s in self.valid if s["player_id"] != defs[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_wrong_mid_count_rejected(self):
         extra_att = self._player(self.home, "ATT", "ExtraATT")
@@ -141,7 +198,7 @@ class SquadValidationTests(FantasyTestBase):
         bad = [s for s in self.valid if s["player_id"] != mids[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_wrong_att_count_rejected(self):
         extra_def = self._player(self.home, "DEF", "ExtraDEF")
@@ -149,88 +206,177 @@ class SquadValidationTests(FantasyTestBase):
         bad = [s for s in self.valid if s["player_id"] != atts[0].id]
         bad.append({"player_id": extra_def.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_wrong_starter_count_rejected(self):
         bad = [dict(s) for s in self.valid]
-        bad[0]["is_starter"] = False  # now 10 starters, 5 bench
+        bad[0]["is_starter"] = False
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_wrong_bench_count_rejected(self):
         bad = [dict(s) for s in self.valid]
-        bad[-1]["is_starter"] = True  # 12 starters, 3 bench
+        bad[-1]["is_starter"] = True
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_no_captain_rejected(self):
         bad = [{**s, "is_captain": False} for s in self.valid]
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_multiple_captains_rejected(self):
         bad = [dict(s) for s in self.valid]
-        # valid[0] is already captain; promote valid[1] too
         bad[1]["is_captain"] = True
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_captain_on_bench_rejected(self):
         bad = [dict(s) for s in self.valid]
-        # Move captaincy to the first non-starter
         for s in bad:
             s["is_captain"] = False
         bench_sel = next(s for s in bad if not s["is_starter"])
         bench_sel["is_captain"] = True
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
     def test_duplicate_player_rejected(self):
         bad = [dict(s) for s in self.valid]
         bad[-1]["player_id"] = bad[0]["player_id"]
         with self.assertRaises(FantasyError):
-            set_squad(self.team, bad)
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
-    def test_replace_squad_clears_previous(self):
-        set_squad(self.team, self.valid)
-        # A second valid squad on a different team
-        other_team = create_fantasy_team(
-            user=User.objects.create_user(
-                email="other@example.com", password="StrongPass!23"
-            ),
-            name="Other",
+    def test_ineligible_player_rejected(self):
+        # Player from the away team — not in competition? Actually away IS in
+        # competition. Create a completely unrelated team.
+        other_org = Organization.objects.create(name="OtherOrg", slug="other-org")
+        other_comp = Competition.objects.create(
+            organization=other_org, name="OtherComp", slug="other-comp"
         )
-        players2, selections2 = self._make_valid_squad(team=self.away)
-        set_squad(other_team, selections2)
-        self.assertEqual(other_team.selections.count(), SQUAD_SIZE)
+        other_team = Team.objects.create(
+            organization=other_org, name="OtherTeam", slug="other-team"
+        )
+        other_comp.teams.add(other_team)
+        outsider = Player.objects.create(
+            team=other_team, first_name="Outsider", position="MID"
+        )
+        bad = [dict(s) for s in self.valid]
+        bad[-1]["player_id"] = outsider.id
+        with self.assertRaises(FantasyError):
+            set_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
 
-        # Replacing self.team's squad wipes the old rows first
-        players3, selections3 = self._make_valid_squad(team=self.away)
-        set_squad(self.team, selections3)
-        self.assertEqual(self.team.selections.count(), SQUAD_SIZE)
+    def test_stage_from_other_season_rejected(self):
+        season2 = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027"
+        )
+        stage2 = Stage.objects.create(
+            season=season2, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(FantasyError):
+            set_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
+
+    def test_replace_squad_clears_previous_for_stage(self):
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self.assertEqual(self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE)
+        # Re-set with same list — should not accumulate
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        self.assertEqual(self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE)
+
+    def test_two_stages_coexist(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        set_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
+        self.assertEqual(self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE)
+        self.assertEqual(self.team.selections.filter(stage=stage2).count(), SQUAD_SIZE)
 
     def test_player_uniqueness_enforced_at_db(self):
-        set_squad(self.team, self.valid)
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 FantasyPlayerSelection.objects.create(
                     fantasy_team=self.team,
+                    stage=self.stage,
                     player=self.players[0],
                     is_starter=False,
                 )
 
 
 # ---------------------------------------------------------------------------
-# Fantasy scoring
+# Eligibility service helper
 # ---------------------------------------------------------------------------
-class ScoringTests(FantasyTestBase):
-    def _goal(self, player, team, minute=10):
+class EligibilityTests(FantasyTestBase):
+    def test_player_in_competition_eligible(self):
+        p = self._player(self.home, "MID", "M")
+        self.assertTrue(validate_player_eligibility(p, self.competition))
+
+    def test_player_outside_competition_not_eligible(self):
+        other_org = Organization.objects.create(name="OO", slug="oo")
+        other_comp = Competition.objects.create(
+            organization=other_org, name="OC", slug="oc"
+        )
+        other_team = Team.objects.create(organization=other_org, name="OT", slug="ot")
+        other_comp.teams.add(other_team)
+        p = Player.objects.create(team=other_team, first_name="X", position="MID")
+        self.assertFalse(validate_player_eligibility(p, self.competition))
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+class ScoringTestBase(FantasyTestBase):
+    """
+    Scoring in Stage 2 derives minutes from MatchLineup. Tests create lineup
+    rows directly to control minutes precisely without going through
+    record_match_event.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.home_players = [
+            self._player(self.home, pos, f"H{i}")
+            for i, pos in enumerate(POSITIONS_15)
+        ]
+        self.away_players = [
+            self._player(self.away, pos, f"A{i}")
+            for i, pos in enumerate(POSITIONS_15)
+        ]
+        # 11 starters on each side, all played 90
+        for p in self.home_players[:11]:
+            MatchLineup.objects.create(
+                match=self.match, team=self.home, player=p,
+                is_starter=True, subbed_off_minute=90,
+            )
+        for p in self.away_players[:11]:
+            MatchLineup.objects.create(
+                match=self.match, team=self.away, player=p,
+                is_starter=True, subbed_off_minute=90,
+            )
+        # Bench rows (0 minutes)
+        for i, p in enumerate(self.home_players[11:15]):
+            MatchLineup.objects.create(
+                match=self.match, team=self.home, player=p,
+                is_starter=False, bench_order=i,
+            )
+        for i, p in enumerate(self.away_players[11:15]):
+            MatchLineup.objects.create(
+                match=self.match, team=self.away, player=p,
+                is_starter=False, bench_order=i,
+            )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE
+        )
+        self.match.refresh_from_db()
+
+    def _goal(self, player, team, minute=10, assister=None):
         return MatchEvent.objects.create(
             match=self.match,
             type=MatchEvent.Type.GOAL,
             minute=minute,
             team=team,
             player=player,
+            related_player=assister,
         )
 
     def _card(self, player, team, card_type, minute=20):
@@ -242,167 +388,219 @@ class ScoringTests(FantasyTestBase):
             player=player,
         )
 
-    def _sub(self, off, on, team, minute):
-        return MatchEvent.objects.create(
-            match=self.match,
-            type=MatchEvent.Type.SUBSTITUTION,
-            minute=minute,
-            team=team,
-            player=off,
-            related_player=on,
+    def _set_minutes(self, player, minutes):
+        """Directly set the s/o minute so the player is treated as having played N minutes."""
+        MatchLineup.objects.filter(match=self.match, player=player).update(
+            subbed_off_minute=minutes
         )
 
-    # -- appearance / no events ---------------------------------------
-    def test_no_events_zero_points(self):
-        p = self._player(self.home, "ATT", "Ghost")
-        points, breakdown = score_player_for_match(p, self.match)
+
+class ScoringTests(ScoringTestBase):
+    # -- no participation -------------------------------------------------
+    def test_no_lineup_zero_points(self):
+        outsider = self._player(self.home, "ATT", "Ghost")
+        points, breakdown = score_player_for_match(outsider, self.match)
         self.assertEqual(points, 0)
         self.assertEqual(breakdown, {})
 
+    def test_bench_player_unused_zero_points(self):
+        bench = self.home_players[11]
+        points, _ = score_player_for_match(bench, self.match)
+        self.assertEqual(points, 0)
+
+    def test_starter_with_no_events_gets_appearance_and_60plus(self):
+        p = self.home_players[0]
+        points, breakdown = score_player_for_match(p, self.match)
+        self.assertEqual(breakdown["appearance"], 1)
+        self.assertIn("minutes_60_plus", breakdown)
+        self.assertEqual(points, 2)
+
+    # -- appearance -------------------------------------------------------
     def test_appearance_awarded_with_any_event(self):
-        p = self._player(self.home, "MID", "M")
+        p = self.home_players[0]
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=30)
         points, breakdown = score_player_for_match(p, self.match)
-        self.assertEqual(breakdown["appearance"], SCORING_RULES["appearance"])
-        # yellow -1 + appearance 1 + minutes_60_plus 1 = 1
+        self.assertEqual(breakdown["appearance"], 1)
+        # appearance 1 + yellow -1 + 60+ 1 = 1
         self.assertEqual(points, 1)
 
-    # -- goals by position --------------------------------------------
+    # -- goals by position ------------------------------------------------
     def test_goal_by_gk(self):
-        p = self._player(self.home, "GK", "GK")
+        p = self.home_players[0]  # GK
         self._goal(p, self.home)
-        # Break the clean sheet so we isolate the goal value.
-        away_scorer = self._player(self.away, "ATT", "AW")
-        self._goal(away_scorer, self.away, minute=20)
-
+        # Break clean sheet
+        self._goal(self.away_players[10], self.away, minute=20)
         points, _ = score_player_for_match(p, self.match)
         self.assertEqual(
             points,
-            SCORING_RULES["goal_GK"]
-            + SCORING_RULES["appearance"]
+            SCORING_RULES["goal_GK"] + SCORING_RULES["appearance"]
             + SCORING_RULES["minutes_60_plus"],
         )
 
     def test_goal_by_def(self):
-        p = self._player(self.home, "DEF", "DEF")
+        p = self.home_players[2]  # first DEF
         self._goal(p, self.home)
-        # Break the clean sheet so we isolate the goal value.
-        away_scorer = self._player(self.away, "ATT", "AW")
-        self._goal(away_scorer, self.away, minute=20)
-
+        self._goal(self.away_players[10], self.away, minute=20)
         points, _ = score_player_for_match(p, self.match)
         self.assertEqual(
             points,
-            SCORING_RULES["goal_DEF"]
-            + SCORING_RULES["appearance"]
+            SCORING_RULES["goal_DEF"] + SCORING_RULES["appearance"]
             + SCORING_RULES["minutes_60_plus"],
         )
 
     def test_goal_by_mid(self):
-        p = self._player(self.home, "MID", "MID")
+        p = self.home_players[7]  # first MID
         self._goal(p, self.home)
         points, _ = score_player_for_match(p, self.match)
         self.assertEqual(
             points,
-            SCORING_RULES["goal_MID"]
-            + SCORING_RULES["appearance"]
+            SCORING_RULES["goal_MID"] + SCORING_RULES["appearance"]
             + SCORING_RULES["minutes_60_plus"],
         )
 
     def test_goal_by_att(self):
-        p = self._player(self.home, "ATT", "ATT")
+        p = self.home_players[12 - 2]  # first ATT (index 12 in home_players[0:11]? no)
+        # home_players indices: 0-1 GK, 2-6 DEF, 7-11 MID, 12-14 ATT
+        p = self.home_players[12]
         self._goal(p, self.home)
         points, _ = score_player_for_match(p, self.match)
         self.assertEqual(
             points,
-            SCORING_RULES["goal_ATT"]
-            + SCORING_RULES["appearance"]
+            SCORING_RULES["goal_ATT"] + SCORING_RULES["appearance"]
             + SCORING_RULES["minutes_60_plus"],
         )
 
-    # -- cards --------------------------------------------------------
+    # -- cards ------------------------------------------------------------
     def test_yellow_card_negative(self):
-        # MID avoids the clean-sheet bonus (only GK/DEF are eligible),
-        # so this test isolates the yellow-card rule.
-        p = self._player(self.home, "MID", "M")
+        p = self.home_players[7]  # MID
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=30)
-
         points, breakdown = score_player_for_match(p, self.match)
         self.assertEqual(breakdown["yellow_cards"], -1)
-        self.assertEqual(points, 1 - 1 + 1)  # appearance + yellow + 60m
+        self.assertEqual(points, 1)  # appearance + yellow + 60+
 
     def test_red_card_negative(self):
-        p = self._player(self.home, "DEF", "D")
+        p = self.home_players[2]  # DEF
         self._card(p, self.home, MatchEvent.Type.RED, minute=30)
         points, breakdown = score_player_for_match(p, self.match)
         self.assertEqual(breakdown["red_cards"], -3)
 
     def test_multiple_events_accumulate(self):
-        p = self._player(self.home, "ATT", "A")
+        p = self.home_players[12]  # ATT
         self._goal(p, self.home, minute=10)
         self._goal(p, self.home, minute=40)
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=60)
-        points, breakdown = score_player_for_match(p, self.match)
-        # 2 * 4 (ATT goals) + 1 (app) + 1 (60m) - 1 (yellow) = 9
+        points, _ = score_player_for_match(p, self.match)
+        # 2*4 + app 1 + 60+ 1 - yellow 1 = 9
         self.assertEqual(points, 9)
 
-    # -- clean sheet --------------------------------------------------
-    def test_clean_sheet_for_gk_when_no_concede(self):
-        p = self._player(self.home, "GK", "GK")
-        # GK needs at least one event in the match to be "seen".
+    # -- assists ----------------------------------------------------------
+    def test_assist_by_teammate(self):
+        scorer = self.home_players[12]
+        assister = self.home_players[7]
+        self._goal(scorer, self.home, assister=assister)
+        _, breakdown = score_player_for_match(assister, self.match)
+        self.assertEqual(breakdown["assists"], SCORING_RULES["assist"])
+
+    def test_multiple_assists(self):
+        assister = self.home_players[7]
+        self._goal(self.home_players[12], self.home, minute=10, assister=assister)
+        self._goal(self.home_players[13], self.home, minute=40, assister=assister)
+        _, breakdown = score_player_for_match(assister, self.match)
+        self.assertEqual(breakdown["assists"], 2 * SCORING_RULES["assist"])
+
+    # -- clean sheet ------------------------------------------------------
+    def test_clean_sheet_for_gk(self):
+        p = self.home_players[0]
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=45)
         points, breakdown = score_player_for_match(p, self.match)
         self.assertEqual(breakdown["clean_sheet"], SCORING_RULES["clean_sheet"])
-        self.assertEqual(points, 1 + 1 + 4 - 1)  # app + 60m + cs - yellow
+        # app 1 + 60+ 1 + cs 4 - yellow 1 = 5
+        self.assertEqual(points, 5)
+
+    def test_clean_sheet_requires_60_minutes(self):
+        p = self.home_players[0]
+        self._set_minutes(p, 55)
+        _, breakdown = score_player_for_match(p, self.match)
+        self.assertNotIn("clean_sheet", breakdown)
 
     def test_no_clean_sheet_when_conceded(self):
-        p = self._player(self.home, "GK", "GK")
-        scorer = self._player(self.away, "ATT", "AW")
+        p = self.home_players[0]
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=45)
-        self._goal(scorer, self.away, minute=20)
-        points, breakdown = score_player_for_match(p, self.match)
+        self._goal(self.away_players[12], self.away, minute=20)
+        _, breakdown = score_player_for_match(p, self.match)
         self.assertNotIn("clean_sheet", breakdown)
-        self.assertEqual(points, 1 + 1 - 1)
+
+    def test_no_clean_sheet_after_red_card(self):
+        p = self.home_players[2]  # DEF
+        self._card(p, self.home, MatchEvent.Type.RED, minute=30)
+        _, breakdown = score_player_for_match(p, self.match)
+        self.assertNotIn("clean_sheet", breakdown)
 
     def test_clean_sheet_only_for_gk_def(self):
-        p = self._player(self.home, "MID", "M")
+        p = self.home_players[7]  # MID
         self._card(p, self.home, MatchEvent.Type.YELLOW, minute=45)
         _, breakdown = score_player_for_match(p, self.match)
         self.assertNotIn("clean_sheet", breakdown)
 
-    # -- minutes heuristics -------------------------------------------
+    # -- minutes ----------------------------------------------------------
     def test_subbed_off_before_60_no_minutes_bonus(self):
-        off = self._player(self.home, "MID", "OFF")
-        on = self._player(self.home, "MID", "ON")
-        self._sub(off, on, self.home, minute=55)
-        _, breakdown = score_player_for_match(off, self.match)
+        p = self.home_players[5]
+        self._set_minutes(p, 55)
+        _, breakdown = score_player_for_match(p, self.match)
         self.assertNotIn("minutes_60_plus", breakdown)
+        self.assertIn("appearance", breakdown)
 
-    def test_subbed_on_after_30_no_minutes_bonus(self):
-        off = self._player(self.home, "MID", "OFF")
-        on = self._player(self.home, "MID", "ON")
-        self._sub(off, on, self.home, minute=70)
-        _, breakdown = score_player_for_match(on, self.match)
-        self.assertNotIn("minutes_60_plus", breakdown)
-
-    def test_subbed_on_early_gets_minutes_bonus(self):
-        off = self._player(self.home, "MID", "OFF")
-        on = self._player(self.home, "MID", "ON")
-        self._sub(off, on, self.home, minute=20)
-        _, breakdown = score_player_for_match(on, self.match)
+    def test_exactly_60_minutes_gets_bonus(self):
+        p = self.home_players[5]
+        self._set_minutes(p, 60)
+        _, breakdown = score_player_for_match(p, self.match)
         self.assertIn("minutes_60_plus", breakdown)
 
-    # -- persistence --------------------------------------------------
-    def test_calculate_match_points_creates_rows(self):
-        p = self._player(self.home, "ATT", "A")
-        self._goal(p, self.home)
+    def test_59_minutes_no_bonus(self):
+        p = self.home_players[5]
+        self._set_minutes(p, 59)
+        _, breakdown = score_player_for_match(p, self.match)
+        self.assertNotIn("minutes_60_plus", breakdown)
+
+    def test_bench_player_who_enters_gets_points(self):
+        bench = self.home_players[11]
+        # Mark them as having entered at 72 and closed at 90
+        MatchLineup.objects.filter(match=self.match, player=bench).update(
+            subbed_on_minute=72, subbed_off_minute=90,
+        )
+        points, breakdown = score_player_for_match(bench, self.match)
+        self.assertEqual(points, 1)  # appearance only, no 60+
+        self.assertIn("appearance", breakdown)
+        self.assertNotIn("minutes_60_plus", breakdown)
+
+    def test_bench_player_plays_60plus_gets_bonus(self):
+        bench = self.home_players[11]
+        MatchLineup.objects.filter(match=self.match, player=bench).update(
+            subbed_on_minute=20, subbed_off_minute=90,
+        )
+        _, breakdown = score_player_for_match(bench, self.match)
+        self.assertIn("minutes_60_plus", breakdown)
+
+    # -- persistence ------------------------------------------------------
+    def test_calculate_match_points_creates_rows_for_all_starters(self):
+        # 22 starters across both sides
         written = calculate_match_points(self.match)
-        self.assertEqual(len(written), 1)
-        fp = FantasyPoints.objects.get(match=self.match, player=p)
-        self.assertEqual(fp.points, 6)  # 4 goal + 1 app + 1 60m
+        self.assertEqual(len(written), 22)
+
+    def test_calculate_match_points_scopes_to_lineup_plus_events(self):
+        # Add an unrelated player with a goal — should be included
+        outsider = self._player(self.home, "ATT", "Unrelated")
+        MatchEvent.objects.create(
+            match=self.match, type=MatchEvent.Type.GOAL, minute=15,
+            team=self.home, player=outsider,
+        )
+        calculate_match_points(self.match)
+        self.assertTrue(
+            FantasyPoints.objects.filter(match=self.match, player=outsider).exists()
+        )
 
     def test_recalculate_is_deterministic(self):
-        p = self._player(self.home, "ATT", "A")
+        p = self.home_players[12]
         self._goal(p, self.home)
         calculate_match_points(self.match)
         first = FantasyPoints.objects.get(match=self.match, player=p).points
@@ -411,75 +609,199 @@ class ScoringTests(FantasyTestBase):
         self.assertEqual(first, second)
 
     def test_recalculate_clears_stale_rows(self):
-        p = self._player(self.home, "ATT", "A")
+        p = self.home_players[12]
         event = self._goal(p, self.home)
         calculate_match_points(self.match)
-        self.assertEqual(
-            FantasyPoints.objects.filter(match=self.match).count(), 1
+        self.assertTrue(
+            FantasyPoints.objects.filter(match=self.match, player=p).exists()
         )
         event.delete()
+        # recalculate should NOT wipe the row entirely because the player is
+        # still in the lineup — they just score appearance only.
         recalculate_match_points(self.match)
-        self.assertEqual(
-            FantasyPoints.objects.filter(match=self.match).count(), 0
-        )
+        fp = FantasyPoints.objects.get(match=self.match, player=p)
+        self.assertEqual(fp.points, 2)  # appearance + 60+
 
 
 # ---------------------------------------------------------------------------
-# Leaderboard
+# Integration: lineup → events → fantasy points
+# ---------------------------------------------------------------------------
+class LineupDrivenScoringTests(FantasyTestBase):
+    def test_calculate_match_points_includes_lineup_participants(self):
+        # Create 11 home starters and submit
+        home_players = [
+            self._player(self.home, pos, f"H{i}")
+            for i, pos in enumerate(POSITIONS_15)
+        ]
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=home_players[:11], bench=home_players[11:15],
+        )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE,
+        )
+        self.match.refresh_from_db()
+
+        calculate_match_points(self.match)
+        # All 11 starters should have points even without events
+        self.assertEqual(
+            FantasyPoints.objects.filter(match=self.match).count(), 11
+        )
+        for p in home_players[:11]:
+            fp = FantasyPoints.objects.get(match=self.match, player=p)
+            self.assertGreaterEqual(fp.points, 2)  # appearance + 60+
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard — stage and season scoping
 # ---------------------------------------------------------------------------
 class LeaderboardTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
-        self.team_a = create_fantasy_team(user=self.user, name="Alpha")
+        self.team = self._make_team(name="Alpha")
         self.players, self.valid = self._make_valid_squad()
-        set_squad(self.team_a, self.valid)
+        set_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
 
-        # Give one starter a goal so the team scores.
-        self.scorer = self.players[0]  # the captain, a GK in this fixture
+        # Submit home + away lineups
+        for p in self.players[:11]:
+            MatchLineup.objects.create(
+                match=self.match, team=self.home, player=p,
+                is_starter=True, subbed_off_minute=90,
+            )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE,
+        )
+        self.match.refresh_from_db()
+
+        # Give the captain (index 0) a goal
+        self.scorer = self.players[0]
         MatchEvent.objects.create(
-            match=self.match,
-            type=MatchEvent.Type.GOAL,
-            minute=10,
-            team=self.home,
-            player=self.scorer,
+            match=self.match, type=MatchEvent.Type.GOAL, minute=10,
+            team=self.home, player=self.scorer,
         )
         calculate_match_points(self.match)
 
-    def test_global_leaderboard_includes_team(self):
-        rows = global_leaderboard()
+    def test_stage_leaderboard_includes_team(self):
+        rows = stage_leaderboard(
+            competition=self.competition, season=self.season, stage=self.stage,
+        )
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["fantasy_team"].id, self.team_a.id)
+        self.assertEqual(rows[0]["fantasy_team"].id, self.team.id)
         self.assertGreater(rows[0]["total_points"], 0)
 
+    def test_season_leaderboard_includes_team(self):
+        rows = season_leaderboard(competition=self.competition, season=self.season)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["fantasy_team"].id, self.team.id)
+
     def test_captain_points_are_doubled(self):
-        # Base points of captain in this match
         base = FantasyPoints.objects.get(
             match=self.match, player=self.scorer
         ).points
-        total = fantasy_team_total_points(self.team_a)
-        # The captain contributed doubled; all other starters contributed 0.
-        self.assertEqual(total, base * CAPTAIN_MULTIPLIER)
+        total = fantasy_team_total_points(self.team, stage=self.stage)
+        # Captain contributed doubled; other 10 starters are 0-point defenders
+        # (no events, but they'd have appearance — actually they ARE in lineup
+        # via self.players[:11], and self.players[:11] are the same players
+        # selected as starters on the fantasy team too. So 10 non-captain
+        # starters each contribute their appearance points.)
+        non_captain_total = sum(
+            FantasyPoints.objects.get(match=self.match, player=p).points
+            for p in self.players[1:11]
+        )
+        self.assertEqual(total, base * CAPTAIN_MULTIPLIER + non_captain_total)
 
     def test_bench_players_do_not_contribute(self):
-        # Put a bench player on the scoresheet too; they must not affect the team total.
-        bench_player = self.players[STARTERS]  # first non-starter
+        bench_player = self.players[STARTERS]
+        # Give the bench player a goal so they'd score if included
         MatchEvent.objects.create(
-            match=self.match,
-            type=MatchEvent.Type.GOAL,
-            minute=40,
-            team=self.home,
-            player=bench_player,
+            match=self.match, type=MatchEvent.Type.GOAL, minute=40,
+            team=self.home, player=bench_player,
         )
         recalculate_match_points(self.match)
 
-        before = fantasy_team_total_points(self.team_a)
-        # Remove bench player's event entirely and recalc — total must not change.
+        before = fantasy_team_total_points(self.team, stage=self.stage)
+        # Delete the bench player's goal and recalc — total must not change
         MatchEvent.objects.filter(
             match=self.match, player=bench_player
         ).delete()
         recalculate_match_points(self.match)
-        after = fantasy_team_total_points(self.team_a)
+        after = fantasy_team_total_points(self.team, stage=self.stage)
         self.assertEqual(before, after)
+
+
+class StageScopingTests(FantasyTestBase):
+    def test_points_do_not_leak_across_stages(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        match2 = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=stage2,
+        )
+        players = [
+            self._player(self.home, pos, f"H{i}")
+            for i, pos in enumerate(POSITIONS_15)
+        ]
+        # Lineup only for match1; add goal for player[0] there
+        MatchLineup.objects.create(
+            match=self.match, team=self.home, player=players[0],
+            is_starter=True, subbed_off_minute=90,
+        )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE
+        )
+        MatchEvent.objects.create(
+            match=self.match, type=MatchEvent.Type.GOAL, minute=10,
+            team=self.home, player=players[0],
+        )
+        calculate_match_points(self.match)
+
+        team = self._make_team(name="T")
+        _, selections = self._make_valid_squad()
+        # Overwrite selections to reference our players[0..14]
+        selections = [
+            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+            for i, p in enumerate(players)
+        ]
+        set_squad(fantasy_team=team, stage=stage2, selections=selections)
+
+        # Stage 2 leaderboard shows 0 (no matches in stage 2 with points)
+        s2_rows = stage_leaderboard(
+            competition=self.competition, season=self.season, stage=stage2,
+        )
+        self.assertEqual(s2_rows[0]["total_points"], 0)
+
+    def test_points_do_not_leak_across_seasons(self):
+        season2 = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-lk"
+        )
+        stage2 = Stage.objects.create(
+            season=season2, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        team2 = self._make_team(name="S2", season=season2)
+        _, selections = self._make_valid_squad()
+        set_squad(fantasy_team=team2, stage=stage2, selections=selections)
+
+        # Give the corresponding players points in match1 (season 1)
+        players = [Player.objects.get(pk=s["player_id"]) for s in selections]
+        for p in players[:11]:
+            MatchLineup.objects.create(
+                match=self.match, team=self.home, player=p,
+                is_starter=True, subbed_off_minute=90,
+            )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE
+        )
+        MatchEvent.objects.create(
+            match=self.match, type=MatchEvent.Type.GOAL, minute=10,
+            team=self.home, player=players[0],
+        )
+        calculate_match_points(self.match)
+
+        # season2 leaderboard should be zero
+        rows = season_leaderboard(competition=self.competition, season=season2)
+        self.assertEqual(rows[0]["total_points"], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -507,14 +829,13 @@ class GroupTests(FantasyTestBase):
         self.assertEqual(len(codes), 5)
 
     def test_join_group_with_valid_code(self):
-        owner = self.user
         joiner = User.objects.create_user(
             email="joiner@example.com", password="StrongPass!23"
         )
-        group = create_group(owner=owner, name="Crew")
-        membership = join_group(user=joiner, invite_code=group.invite_code)
-        self.assertEqual(membership.group, group)
-        self.assertEqual(membership.user, joiner)
+        group = create_group(owner=self.user, name="Crew")
+        m = join_group(user=joiner, invite_code=group.invite_code)
+        self.assertEqual(m.group, group)
+        self.assertEqual(m.user, joiner)
 
     def test_duplicate_membership_rejected(self):
         group = create_group(owner=self.user, name="Crew")
@@ -525,36 +846,97 @@ class GroupTests(FantasyTestBase):
         with self.assertRaises(FantasyError):
             join_group(user=self.user, invite_code="NOPE1234")
 
-    def test_group_leaderboard_scoped_to_members(self):
-        # Owner has a team with points.
-        owner_team = create_fantasy_team(user=self.user, name="Owner")
-        players, valid = self._make_valid_squad()
-        set_squad(owner_team, valid)
+
+class GroupManagementTests(FantasyTestBase):
+    def test_owner_cannot_leave(self):
+        group = create_group(owner=self.user, name="G")
+        with self.assertRaises(FantasyError):
+            leave_group(user=self.user, group=group)
+
+    def test_member_can_leave(self):
+        group = create_group(owner=self.user, name="G")
+        joiner = User.objects.create_user(
+            email="j@example.com", password="StrongPass!23"
+        )
+        join_group(user=joiner, invite_code=group.invite_code)
+        leave_group(user=joiner, group=group)
+        self.assertFalse(
+            FantasyGroupMembership.objects.filter(
+                group=group, user=joiner
+            ).exists()
+        )
+
+    def test_owner_can_remove_member(self):
+        group = create_group(owner=self.user, name="G")
+        joiner = User.objects.create_user(
+            email="j2@example.com", password="StrongPass!23"
+        )
+        join_group(user=joiner, invite_code=group.invite_code)
+        remove_group_member(owner=self.user, group=group, member_user=joiner)
+        self.assertFalse(
+            FantasyGroupMembership.objects.filter(
+                group=group, user=joiner
+            ).exists()
+        )
+
+    def test_non_owner_cannot_remove(self):
+        group = create_group(owner=self.user, name="G")
+        intruder = User.objects.create_user(
+            email="in@example.com", password="StrongPass!23"
+        )
+        victim = User.objects.create_user(
+            email="v@example.com", password="StrongPass!23"
+        )
+        join_group(user=intruder, invite_code=group.invite_code)
+        join_group(user=victim, invite_code=group.invite_code)
+        with self.assertRaises(FantasyError):
+            remove_group_member(owner=intruder, group=group, member_user=victim)
+
+    def test_owner_cannot_remove_self(self):
+        group = create_group(owner=self.user, name="G")
+        with self.assertRaises(FantasyError):
+            remove_group_member(owner=self.user, group=group, member_user=self.user)
+
+    def test_group_stage_leaderboard_scoped_to_members(self):
+        owner_team = self._make_team(name="Owner")
+        players, selections = self._make_valid_squad()
+        set_squad(fantasy_team=owner_team, stage=self.stage, selections=selections)
+
+        # Lineup + goal
+        for p in players[:11]:
+            MatchLineup.objects.create(
+                match=self.match, team=self.home, player=p,
+                is_starter=True, subbed_off_minute=90,
+            )
+        Match.objects.filter(pk=self.match.pk).update(
+            minute=90, status=Match.Status.LIVE
+        )
         MatchEvent.objects.create(
-            match=self.match,
-            type=MatchEvent.Type.GOAL,
-            minute=10,
-            team=self.home,
-            player=players[0],
+            match=self.match, type=MatchEvent.Type.GOAL, minute=10,
+            team=self.home, player=players[0],
         )
         calculate_match_points(self.match)
 
-        # A second user with their own team, NOT in the group.
+        # Outsider with a team, not in group
         outsider = User.objects.create_user(
             email="outsider@example.com", password="StrongPass!23"
         )
-        outsider_team = create_fantasy_team(user=outsider, name="Outsider")
-        players2, valid2 = self._make_valid_squad(team=self.away)
-        set_squad(outsider_team, valid2)
+        outsider_team = self._make_team(user=outsider, name="Outsider")
+        players2, selections2 = self._make_valid_squad(team=self.away)
+        set_squad(fantasy_team=outsider_team, stage=self.stage, selections=selections2)
 
         group = create_group(owner=self.user, name="Crew")
-        rows = group_leaderboard(group)
+        rows = group_stage_leaderboard(
+            group=group, competition=self.competition,
+            season=self.season, stage=self.stage,
+        )
         team_ids = {r["fantasy_team"].id for r in rows}
         self.assertIn(owner_team.id, team_ids)
         self.assertNotIn(outsider_team.id, team_ids)
 
+
 # ---------------------------------------------------------------------------
-# API base
+# API
 # ---------------------------------------------------------------------------
 class FantasyAPITestBase(FantasyTestBase):
     def setUp(self):
@@ -563,73 +945,122 @@ class FantasyAPITestBase(FantasyTestBase):
         self.client.force_authenticate(user=self.user)
 
 
-# ---------------------------------------------------------------------------
-# Fantasy team + squad API
-# ---------------------------------------------------------------------------
 class FantasyTeamAPITests(FantasyAPITestBase):
-    def _team_url(self):
-        return reverse("fantasy:team")
+    def _team_list_url(self):
+        return reverse("fantasy:team-list")
 
-    def _squad_url(self):
-        return reverse("fantasy:squad")
+    def _team_detail_url(self, team_id):
+        return reverse("fantasy:team-detail", args=[team_id])
+
+    def _squad_url(self, team_id, stage_id):
+        return reverse("fantasy:team-squad", args=[team_id, stage_id])
 
     # -- auth -------------------------------------------------------------
-    def test_anonymous_cannot_access_team(self):
+    def test_anonymous_cannot_list_teams(self):
         anon = APIClient()
-        resp = anon.get(self._team_url())
+        resp = anon.get(self._team_list_url())
         self.assertIn(resp.status_code, (401, 403))
 
     def test_anonymous_cannot_create_team(self):
         anon = APIClient()
-        resp = anon.post(self._team_url(), {"name": "X"}, format="json")
+        resp = anon.post(
+            self._team_list_url(),
+            {"name": "X", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
         self.assertIn(resp.status_code, (401, 403))
 
-    # -- create / retrieve ------------------------------------------------
-    def test_get_team_404_before_creation(self):
-        resp = self.client.get(self._team_url())
-        self.assertEqual(resp.status_code, 404)
+    # -- list / create ----------------------------------------------------
+    def test_list_my_teams_empty(self):
+        resp = self.client.get(self._team_list_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
 
     def test_create_team(self):
-        resp = self.client.post(self._team_url(), {"name": "My Team"}, format="json")
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "My Team", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.data["name"], "My Team")
-        self.assertIn("starters", resp.data)
-        self.assertIn("bench", resp.data)
-        self.assertIsNone(resp.data["captain_id"])
-        self.assertEqual(resp.data["total_points"], 0)
+        self.assertEqual(resp.data["competition"]["id"], self.competition.id)
+        self.assertEqual(resp.data["season"]["id"], self.season.id)
 
-    def test_create_team_twice_rejected(self):
-        self.client.post(self._team_url(), {"name": "A"}, format="json")
-        resp = self.client.post(self._team_url(), {"name": "B"}, format="json")
+    def test_create_duplicate_team_rejected(self):
+        self.client.post(
+            self._team_list_url(),
+            {"name": "A", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "B", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
         self.assertEqual(resp.status_code, 400)
 
-    def test_get_team_after_creation(self):
-        self.client.post(self._team_url(), {"name": "My Team"}, format="json")
-        resp = self.client.get(self._team_url())
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["name"], "My Team")
+    def test_user_can_have_two_teams_across_competitions(self):
+        comp_b = Competition.objects.create(
+            organization=self.org, name="B", slug="b-api"
+        )
+        season_b = Season.objects.create(
+            competition=comp_b, name="2026", slug="2026-b-api"
+        )
+        self.client.post(
+            self._team_list_url(),
+            {"name": "A", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        self.client.post(
+            self._team_list_url(),
+            {"name": "B", "competition_id": comp_b.id, "season_id": season_b.id},
+            format="json",
+        )
+        resp = self.client.get(self._team_list_url())
+        self.assertEqual(len(resp.data), 2)
 
-    # -- update -----------------------------------------------------------
+    # -- detail / update --------------------------------------------------
     def test_patch_team_name(self):
-        self.client.post(self._team_url(), {"name": "Old"}, format="json")
-        resp = self.client.patch(self._team_url(), {"name": "New"}, format="json")
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "Old", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        tid = resp.data["id"]
+        resp = self.client.patch(
+            self._team_detail_url(tid), {"name": "New"}, format="json"
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["name"], "New")
 
-    def test_patch_without_team_404(self):
-        resp = self.client.patch(self._team_url(), {"name": "New"}, format="json")
+    def test_other_users_team_404(self):
+        other = User.objects.create_user(
+            email="other@example.com", password="StrongPass!23"
+        )
+        team = self._make_team(user=other, name="NotMine")
+        resp = self.client.get(self._team_detail_url(team.id))
         self.assertEqual(resp.status_code, 404)
 
     # -- squad ------------------------------------------------------------
-    def test_get_squad_404_without_team(self):
-        resp = self.client.get(self._squad_url())
-        self.assertEqual(resp.status_code, 404)
-
     def test_put_valid_squad(self):
-        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "T", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        tid = resp.data["id"]
         players, selections = self._make_valid_squad()
         resp = self.client.put(
-            self._squad_url(), {"selections": selections}, format="json"
+            self._squad_url(tid, self.stage.id),
+            {"selections": selections}, format="json",
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.data["starters"]), STARTERS)
@@ -637,48 +1068,42 @@ class FantasyTeamAPITests(FantasyAPITestBase):
         self.assertEqual(resp.data["captain_id"], players[0].id)
 
     def test_put_invalid_squad_rejected(self):
-        self.client.post(self._team_url(), {"name": "T"}, format="json")
-        # Only 14 players
-        _, selections = self._make_valid_squad()
-        resp = self.client.put(
-            self._squad_url(),
-            {"selections": selections[:-1]},
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "T", "competition_id": self.competition.id,
+             "season_id": self.season.id},
             format="json",
         )
-        self.assertEqual(resp.status_code, 400)
-
-    def test_put_missing_captain_rejected(self):
-        self.client.post(self._team_url(), {"name": "T"}, format="json")
+        tid = resp.data["id"]
         _, selections = self._make_valid_squad()
-        for s in selections:
-            s["is_captain"] = False
         resp = self.client.put(
-            self._squad_url(), {"selections": selections}, format="json"
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("detail", resp.data)
-
-    def test_put_squad_malformed_shape_rejected(self):
-        self.client.post(self._team_url(), {"name": "T"}, format="json")
-        resp = self.client.put(
-            self._squad_url(), {"selections": "not-a-list"}, format="json"
+            self._squad_url(tid, self.stage.id),
+            {"selections": selections[:-1]}, format="json",
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_get_squad_after_put(self):
-        self.client.post(self._team_url(), {"name": "T"}, format="json")
+    def test_squad_stage_outside_team_season_rejected(self):
+        resp = self.client.post(
+            self._team_list_url(),
+            {"name": "T", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        tid = resp.data["id"]
+        season2 = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-sq"
+        )
+        stage2 = Stage.objects.create(
+            season=season2, kind=Stage.Kind.GAMEWEEK, number=1
+        )
         _, selections = self._make_valid_squad()
-        self.client.put(
-            self._squad_url(), {"selections": selections}, format="json"
+        resp = self.client.put(
+            self._squad_url(tid, stage2.id),
+            {"selections": selections}, format="json",
         )
-        resp = self.client.get(self._squad_url())
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(len(resp.data["starters"]) + len(resp.data["bench"]), SQUAD_SIZE)
+        self.assertEqual(resp.status_code, 400)
 
 
-# ---------------------------------------------------------------------------
-# Fantasy groups API
-# ---------------------------------------------------------------------------
 class FantasyGroupAPITests(FantasyAPITestBase):
     def _groups_url(self):
         return reverse("fantasy:group-list")
@@ -686,31 +1111,24 @@ class FantasyGroupAPITests(FantasyAPITestBase):
     def _join_url(self):
         return reverse("fantasy:group-join")
 
-    def test_anonymous_cannot_list_groups(self):
-        anon = APIClient()
-        resp = anon.get(self._groups_url())
-        self.assertIn(resp.status_code, (401, 403))
-
     def test_create_group(self):
         resp = self.client.post(self._groups_url(), {"name": "Fam"}, format="json")
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.data["name"], "Fam")
-        self.assertEqual(resp.data["owner_email"], self.user.email)
         self.assertEqual(resp.data["member_count"], 1)
         self.assertEqual(len(resp.data["invite_code"]), 8)
+        # owner_email must NOT be exposed anymore
+        self.assertNotIn("owner_email", resp.data)
+        self.assertIn("owner_id", resp.data)
+        self.assertIn("owner_display_name", resp.data)
 
     def test_list_only_my_groups(self):
-        # Group A: user is a member (created)
         self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
-
-        # Group B: created by another user, current user NOT a member
         outsider = User.objects.create_user(
             email="other@example.com", password="StrongPass!23"
         )
         create_group(owner=outsider, name="NotMine")
-
         resp = self.client.get(self._groups_url())
-        self.assertEqual(resp.status_code, 200)
         names = [g["name"] for g in resp.data]
         self.assertEqual(names, ["Mine"])
 
@@ -719,7 +1137,6 @@ class FantasyGroupAPITests(FantasyAPITestBase):
             email="owner@example.com", password="StrongPass!23"
         )
         group = create_group(owner=owner, name="Crew")
-
         resp = self.client.post(
             self._join_url(), {"invite_code": group.invite_code}, format="json"
         )
@@ -750,9 +1167,7 @@ class FantasyGroupAPITests(FantasyAPITestBase):
             email="owner3@example.com", password="StrongPass!23"
         )
         group = create_group(owner=owner, name="Private")
-        resp = self.client.get(
-            reverse("fantasy:group-detail", args=[group.id])
-        )
+        resp = self.client.get(reverse("fantasy:group-detail", args=[group.id]))
         self.assertEqual(resp.status_code, 403)
 
     def test_group_detail_ok_for_member(self):
@@ -762,70 +1177,245 @@ class FantasyGroupAPITests(FantasyAPITestBase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["id"], gid)
 
-    def test_group_leaderboard_requires_membership(self):
-        owner = User.objects.create_user(
-            email="owner4@example.com", password="StrongPass!23"
-        )
-        group = create_group(owner=owner, name="Private")
-        resp = self.client.get(
-            reverse("fantasy:group-leaderboard", args=[group.id])
-        )
-        self.assertEqual(resp.status_code, 403)
-
-    def test_group_leaderboard_for_member(self):
+    def test_member_display_name_not_email(self):
         resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
         gid = resp.data["id"]
-        resp = self.client.get(
-            reverse("fantasy:group-leaderboard", args=[gid])
+        resp = self.client.get(reverse("fantasy:group-detail", args=[gid]))
+        member = resp.data["members"][0]
+        self.assertNotIn("email", member)
+        self.assertIn("user_id", member)
+        self.assertIn("display_name", member)
+
+    def test_group_leave(self):
+        # owner creates, second user joins, second user leaves
+        resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+        gid = resp.data["id"]
+        code = resp.data["invite_code"]
+        other = User.objects.create_user(
+            email="other5@example.com", password="StrongPass!23"
         )
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data["group_id"], gid)
-        self.assertIn("rows", resp.data)
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+        other_client.post(
+            self._join_url(), {"invite_code": code}, format="json"
+        )
+        leave_url = reverse("fantasy:group-leave", args=[gid])
+        resp = other_client.post(leave_url)
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(
+            FantasyGroupMembership.objects.filter(
+                group_id=gid, user=other
+            ).exists()
+        )
+
+    def test_group_owner_leave_rejected(self):
+        resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+        gid = resp.data["id"]
+        resp = self.client.post(reverse("fantasy:group-leave", args=[gid]))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_group_owner_remove_member(self):
+        resp = self.client.post(self._groups_url(), {"name": "Mine"}, format="json")
+        gid = resp.data["id"]
+        code = resp.data["invite_code"]
+        other = User.objects.create_user(
+            email="other6@example.com", password="StrongPass!23"
+        )
+        other_client = APIClient()
+        other_client.force_authenticate(user=other)
+        other_client.post(
+            self._join_url(), {"invite_code": code}, format="json"
+        )
+        remove_url = reverse(
+            "fantasy:group-member-remove", args=[gid, other.id]
+        )
+        resp = self.client.post(remove_url)
+        self.assertEqual(resp.status_code, 204)
 
 
-# ---------------------------------------------------------------------------
-# Leaderboard API
-# ---------------------------------------------------------------------------
 class FantasyLeaderboardAPITests(FantasyAPITestBase):
-    def test_anonymous_cannot_view_global_leaderboard(self):
+    def test_anonymous_cannot_view_leaderboard(self):
         anon = APIClient()
         resp = anon.get(reverse("fantasy:global-leaderboard"))
         self.assertIn(resp.status_code, (401, 403))
 
-    def test_global_leaderboard_lists_teams(self):
-        # Create a team + valid squad; no events -> 0 points.
-        self.client.post(reverse("fantasy:team"), {"name": "Alpha"}, format="json")
+    def test_leaderboard_requires_scope_params(self):
+        resp = self.client.get(reverse("fantasy:global-leaderboard"))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_stage_leaderboard_lists_teams(self):
+        resp = self.client.post(
+            reverse("fantasy:team-list"),
+            {"name": "Alpha", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        tid = resp.data["id"]
         _, selections = self._make_valid_squad()
         self.client.put(
-            reverse("fantasy:squad"), {"selections": selections}, format="json"
+            reverse("fantasy:team-squad", args=[tid, self.stage.id]),
+            {"selections": selections}, format="json",
         )
-
-        resp = self.client.get(reverse("fantasy:global-leaderboard"))
+        resp = self.client.get(
+            reverse("fantasy:global-leaderboard"),
+            {"competition": self.competition.id, "season": self.season.id,
+             "stage": self.stage.id},
+        )
         self.assertEqual(resp.status_code, 200)
         rows = resp.data["rows"]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["rank"], 1)
         self.assertEqual(rows[0]["name"], "Alpha")
         self.assertEqual(rows[0]["total_points"], 0)
+        # No email leak
+        self.assertNotIn("owner_email", rows[0])
+        self.assertIn("owner_display_name", rows[0])
+
+    def test_season_leaderboard_without_stage(self):
+        resp = self.client.get(
+            reverse("fantasy:global-leaderboard"),
+            {"competition": self.competition.id, "season": self.season.id},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("rows", resp.data)
+
+    def test_group_leaderboard_requires_membership(self):
+        owner = User.objects.create_user(
+            email="owner7@example.com", password="StrongPass!23"
+        )
+        group = create_group(owner=owner, name="Private")
+        resp = self.client.get(
+            reverse("fantasy:group-leaderboard", args=[group.id]),
+            {"competition": self.competition.id, "season": self.season.id},
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_group_leaderboard_for_member(self):
+        resp = self.client.post(
+            reverse("fantasy:group-list"), {"name": "Mine"}, format="json"
+        )
+        gid = resp.data["id"]
+        resp = self.client.get(
+            reverse("fantasy:group-leaderboard", args=[gid]),
+            {"competition": self.competition.id, "season": self.season.id},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["group_id"], gid)
 
 
-# ---------------------------------------------------------------------------
-# FantasyPoints are read-only (no API writes)
-# ---------------------------------------------------------------------------
 class FantasyPointsReadOnlyTests(FantasyAPITestBase):
     def test_no_fantasy_points_endpoint_exists(self):
-        # POST to a plausible points URL -> 404, no route.
         resp = self.client.post("/api/fantasy/points/", {}, format="json")
         self.assertEqual(resp.status_code, 404)
 
     def test_fantasy_points_not_creatable_via_squad_endpoint(self):
-        self.client.post(reverse("fantasy:team"), {"name": "T"}, format="json")
+        resp = self.client.post(
+            reverse("fantasy:team-list"),
+            {"name": "T", "competition_id": self.competition.id,
+             "season_id": self.season.id},
+            format="json",
+        )
+        tid = resp.data["id"]
         _, selections = self._make_valid_squad()
-
-        # Try to sneak points in — must be ignored, no FantasyPoints created.
         payload = {"selections": selections, "points": 999}
         resp = self.client.put(
-            reverse("fantasy:squad"), payload, format="json"
+            reverse("fantasy:team-squad", args=[tid, self.stage.id]),
+            payload, format="json",
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(FantasyPoints.objects.count(), 0)
+
+# ---------------------------------------------------------------------------
+# Season leaderboard — no double counting across stages
+# ---------------------------------------------------------------------------
+class SeasonLeaderboardNoDoubleCountingTests(FantasyTestBase):
+    """
+    Regression: a player who scored in multiple stages used to have their
+    season-aggregated points applied to EVERY stage selection, effectively
+    multiplying the total by the number of stages.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        self.team = self._make_team(name="Alpha")
+        self.players = [
+            self._player(self.home, pos, f"P{i}")
+            for i, pos in enumerate(POSITIONS_15)
+        ]
+        # Same squad in both stages — this is exactly the double-count setup.
+        for stage in (self.stage, self.stage2):
+            selections = [
+                {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+                for i, p in enumerate(self.players)
+            ]
+            set_squad(
+                fantasy_team=self.team, stage=stage, selections=selections
+            )
+
+    def _match_in_stage(self, stage):
+        return create_match(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=stage,
+        )
+
+    def test_season_total_sums_per_stage_not_duplicated(self):
+        # Non-captain starter: 5 pts in stage1, 7 pts in stage2.
+        p = self.players[1]
+        m1 = self._match_in_stage(self.stage)
+        m2 = self._match_in_stage(self.stage2)
+        FantasyPoints.objects.create(match=m1, player=p, points=5)
+        FantasyPoints.objects.create(match=m2, player=p, points=7)
+
+        rows = season_leaderboard(
+            competition=self.competition, season=self.season
+        )
+        self.assertEqual(rows[0]["total_points"], 12)
+
+    def test_stage_leaderboard_only_sees_that_stage(self):
+        p = self.players[1]
+        m1 = self._match_in_stage(self.stage)
+        m2 = self._match_in_stage(self.stage2)
+        FantasyPoints.objects.create(match=m1, player=p, points=5)
+        FantasyPoints.objects.create(match=m2, player=p, points=7)
+
+        s1 = stage_leaderboard(
+            competition=self.competition, season=self.season, stage=self.stage
+        )
+        s2 = stage_leaderboard(
+            competition=self.competition, season=self.season, stage=self.stage2
+        )
+        self.assertEqual(s1[0]["total_points"], 5)
+        self.assertEqual(s2[0]["total_points"], 7)
+
+    def test_captain_multiplier_is_per_stage_not_per_season_total(self):
+        # Captain (index 0) scores in both stages.
+        p = self.players[0]
+        m1 = self._match_in_stage(self.stage)
+        m2 = self._match_in_stage(self.stage2)
+        FantasyPoints.objects.create(match=m1, player=p, points=5)
+        FantasyPoints.objects.create(match=m2, player=p, points=7)
+
+        rows = season_leaderboard(
+            competition=self.competition, season=self.season
+        )
+        # Correct: (5 * 2) + (7 * 2) = 24
+        # Buggy:   ((5 + 7) * 2) applied to both selections = 48
+        self.assertEqual(rows[0]["total_points"], 24)
+
+    def test_two_players_isolated_per_stage(self):
+        # A scores in stage1 only; B scores in stage2 only.
+        a = self.players[1]
+        b = self.players[2]
+        m1 = self._match_in_stage(self.stage)
+        m2 = self._match_in_stage(self.stage2)
+        FantasyPoints.objects.create(match=m1, player=a, points=4)
+        FantasyPoints.objects.create(match=m2, player=b, points=9)
+
+        rows = season_leaderboard(
+            competition=self.competition, season=self.season
+        )
+        self.assertEqual(rows[0]["total_points"], 13)

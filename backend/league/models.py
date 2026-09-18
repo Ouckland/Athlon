@@ -23,6 +23,14 @@ class Competition(models.Model):
         ACTIVE = "ACTIVE", "Active"
         COMPLETED = "COMPLETED", "Completed"
 
+    class Type(models.TextChoices):
+        LEAGUE = "LEAGUE", "League"
+        CUP = "CUP", "Cup"
+
+    type = models.CharField(
+        max_length=8, choices=Type.choices, default=Type.LEAGUE
+    )
+
     organization = models.ForeignKey(
         Organization, on_delete=models.CASCADE, related_name="competitions"
     )
@@ -131,3 +139,73 @@ class Player(models.Model):
     def __str__(self):
         name = self.display_name or f"{self.first_name} {self.last_name}".strip()
         return name or f"Player #{self.pk}"
+
+
+class Season(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        ACTIVE = "ACTIVE", "Active"
+        COMPLETED = "COMPLETED", "Completed"
+
+    competition = models.ForeignKey(
+        Competition, on_delete=models.CASCADE, related_name="seasons"
+    )
+    name = models.CharField(max_length=100)
+    slug = models.SlugField(max_length=120)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.DRAFT
+    )
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["competition", "slug"], name="uniq_season_slug_per_comp"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.competition.name} · {self.name}"
+
+
+class Stage(models.Model):
+    """
+    A scheduling unit inside a Season.
+
+    - LEAGUE competitions use kind=GAMEWEEK (Matchday 1, 2, 3, ...)
+    - CUP competitions use kind=ROUND    (Quarter-final, Semi-final, Final, ...)
+
+    Match and the fantasy engine treat stages identically; only the frontend
+    and the service layer care about the kind.
+    """
+
+    class Kind(models.TextChoices):
+        GAMEWEEK = "GAMEWEEK", "Gameweek"
+        ROUND = "ROUND", "Round"
+
+    season = models.ForeignKey(
+        Season, on_delete=models.CASCADE, related_name="stages"
+    )
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    number = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=100, blank=True)
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["season", "number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["season", "number"], name="uniq_stage_number_per_season"
+            ),
+        ]
+
+    def __str__(self):
+        label = self.name or f"{self.get_kind_display()} {self.number}"
+        return f"{self.season} · {label}"

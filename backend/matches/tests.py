@@ -4,11 +4,11 @@ from django.urls import reverse
 from django.test import TestCase
 from django.utils import timezone
 
-from league.models import Competition, Organization, Player, Team
 
+from league.models import Competition, Organization, Season, Stage, Team, Player
 from fantasy.models import FantasyPoints
-from matches.models import Match, MatchEvent
-from matches.services import MatchError, create_match, record_match_event
+from matches.models import Match, MatchEvent, MatchLineup
+from matches.services import MatchError, create_match, record_match_event, submit_lineup, get_player_minutes
 from rest_framework.test import APIClient
 
 
@@ -1254,3 +1254,546 @@ class MatchAuthorizationTests(_Base):
     def test_anonymous_can_list_events(self):
         resp = self.client.get(self.events_url)
         self.assertEqual(resp.status_code, 200)
+
+
+class MatchStageTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="scout-mstage@example.com",
+            password="StrongPass!23",
+            role=User.Role.SCOUT,
+        )
+        self.org = Organization.objects.create(name="Org", slug="org-mstage")
+        self.league = Competition.objects.create(
+            organization=self.org, name="L", slug="l-mstage",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-mstage"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-mstage"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-mstage"
+        )
+        self.league.teams.add(self.home, self.away)
+
+    # -- service-level validation ---------------------------------------
+    def test_match_without_stage_allowed(self):
+        m = create_match(
+            competition=self.league, home_team=self.home, away_team=self.away,
+        )
+        self.assertIsNone(m.stage)
+
+    def test_match_with_valid_stage_created(self):
+        m = create_match(
+            competition=self.league, home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+        self.assertEqual(m.stage, self.stage)
+
+    def test_match_rejects_stage_from_other_competition(self):
+        other_league = Competition.objects.create(
+            organization=self.org, name="L2", slug="l2-mstage"
+        )
+        other_season = Season.objects.create(
+            competition=other_league, name="2026", slug="2026-other"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        with self.assertRaises(MatchError):
+            create_match(
+                competition=self.league,
+                home_team=self.home,
+                away_team=self.away,
+                stage=other_stage,
+            )
+
+    def test_match_rejects_wrong_stage_kind(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-mstage",
+            type=Competition.Type.CUP,
+        )
+        cup.teams.add(self.home, self.away)
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-cup-mstage"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        with self.assertRaises(MatchError):
+            create_match(
+                competition=self.league,
+                home_team=self.home,
+                away_team=self.away,
+                stage=round_stage,
+            )
+
+    # -- API -------------------------------------------------------------
+    def test_match_serializer_exposes_stage(self):
+        m = create_match(
+            competition=self.league, home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get(reverse("matches:match-detail", args=[m.id]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(resp.data["stage"])
+        self.assertEqual(resp.data["stage"]["id"], self.stage.id)
+        self.assertEqual(resp.data["stage"]["kind"], "GAMEWEEK")
+        self.assertEqual(resp.data["stage"]["number"], 1)
+
+    def test_api_create_match_with_stage_id(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            reverse("matches:match-list"),
+            {
+                "competition_id": self.league.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.away.id,
+                "stage_id": self.stage.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNotNone(resp.data["stage"])
+        self.assertEqual(resp.data["stage"]["id"], self.stage.id)
+
+    def test_api_create_match_without_stage_id(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            reverse("matches:match-list"),
+            {
+                "competition_id": self.league.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.away.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["stage"])
+
+    def test_api_create_match_rejects_stage_from_other_competition(self):
+        other_league = Competition.objects.create(
+            organization=self.org, name="L3", slug="l3-mstage"
+        )
+        other_season = Season.objects.create(
+            competition=other_league, name="2026", slug="2026-l3"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            reverse("matches:match-list"),
+            {
+                "competition_id": self.league.id,
+                "home_team_id": self.home.id,
+                "away_team_id": self.away.id,
+                "stage_id": other_stage.id,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+
+class LineupSubmissionTests(TestCase):
+    def setUp(self):
+        from accounts.models import User
+        from league.models import Competition, Organization, Season, Stage, Team, Player
+        self.org = Organization.objects.create(name="O", slug="o-lineup")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-lineup",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-lineup"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-lineup"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-lineup"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        self.home_players = [
+            Player.objects.create(
+                team=self.home, first_name=f"H{i}", position=Player.Position.MID
+            ) for i in range(15)
+        ]
+        self.away_players = [
+            Player.objects.create(
+                team=self.away, first_name=f"A{i}", position=Player.Position.MID
+            ) for i in range(15)
+        ]
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+
+    def test_valid_lineup_with_bench(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11],
+            bench=self.home_players[11:15],
+        )
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match, team=self.home).count(), 15
+        )
+        self.assertEqual(
+            MatchLineup.objects.filter(
+                match=self.match, team=self.home, is_starter=True
+            ).count(), 11
+        )
+
+    def test_valid_lineup_without_bench(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11], bench=[],
+        )
+        self.assertEqual(
+            MatchLineup.objects.filter(match=self.match, team=self.home).count(), 11
+        )
+
+    def test_wrong_starter_count_rejected(self):
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=self.home_players[:10], bench=[],
+            )
+
+        def test_too_many_bench_rejected(self):
+            extra = Player.objects.create(
+                team=self.home, first_name="ExtraBench", position="MID"
+            )
+            with self.assertRaises(ValueError):
+                submit_lineup(
+                    match=self.match, team=self.home,
+                    starters=self.home_players[:11],
+                    bench=self.home_players[11:15] + [extra],  # 5 bench, over the limit
+            )
+
+    def test_duplicate_starters_rejected(self):
+        p = self.home_players[0]
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=[p] * 11, bench=[],
+            )
+
+    def test_overlap_starter_and_bench_rejected(self):
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=self.home_players[:11],
+                bench=[self.home_players[0]],
+            )
+
+    def test_player_from_other_team_rejected(self):
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=self.home_players[:10] + [self.away_players[0]],
+                bench=[],
+            )
+
+    def test_team_not_in_match_rejected(self):
+        other = Team.objects.create(
+            organization=self.org, name="X", slug="x-lineup"
+        )
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=other,
+                starters=self.home_players[:11], bench=[],
+            )
+
+    def test_lineup_can_be_edited_before_kickoff(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11], bench=[],
+        )
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[1:12], bench=[],
+        )
+        starters = MatchLineup.objects.filter(
+            match=self.match, team=self.home, is_starter=True
+        ).values_list("player_id", flat=True)
+        self.assertIn(self.home_players[11].id, list(starters))
+
+    def test_lineup_rejected_after_kickoff(self):
+        Match.objects.filter(pk=self.match.pk).update(status=Match.Status.LIVE)
+        self.match.refresh_from_db()
+        with self.assertRaises(ValueError):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=self.home_players[:11], bench=[],
+            )
+
+
+class LineupSubstitutionTests(TestCase):
+    def setUp(self):
+        from league.models import (
+            Competition, Organization, Player, Season, Stage, Team,
+        )
+        self.org = Organization.objects.create(name="O", slug="o-sub")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-sub",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-sub"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-sub"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-sub"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
+        self.home_players = [
+            Player.objects.create(
+                team=self.home, first_name=f"H{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+        self.away_players = [
+            Player.objects.create(
+                team=self.away, first_name=f"A{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+
+    def test_substitution_updates_minutes(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11],
+            bench=[self.home_players[11]],
+        )
+        record_match_event(
+            match=self.match, event_type=MatchEvent.Type.SUBSTITUTION,
+            minute=60, team=self.home,
+            player=self.home_players[0], related_player=self.home_players[11],
+        )
+        off = MatchLineup.objects.get(match=self.match, player=self.home_players[0])
+        on = MatchLineup.objects.get(match=self.match, player=self.home_players[11])
+        self.assertEqual(off.subbed_off_minute, 60)
+        self.assertEqual(on.subbed_on_minute, 60)
+
+    def test_substitution_requires_lineup(self):
+        with self.assertRaises(MatchError):
+            record_match_event(
+                match=self.match, event_type=MatchEvent.Type.SUBSTITUTION,
+                minute=60, team=self.home,
+                player=self.home_players[0], related_player=self.home_players[11],
+            )
+
+        def test_subbed_on_bench_player_then_closed_at_fulltime(self):
+            submit_lineup(
+                match=self.match, team=self.home,
+                starters=self.home_players[:11], bench=[self.home_players[11]],
+            )
+            record_match_event(
+                match=self.match, event_type=MatchEvent.Type.SUBSTITUTION,
+                minute=72, team=self.home,
+                player=self.home_players[0], related_player=self.home_players[11],
+            )
+            # FULLTIME requires HALFTIME first — record it to satisfy the lifecycle.
+            record_match_event(
+                match=self.match, event_type=MatchEvent.Type.HALFTIME, minute=45,
+            )
+            record_match_event(
+                match=self.match, event_type=MatchEvent.Type.FULLTIME, minute=90,
+            )
+            self.assertEqual(get_player_minutes(self.home_players[11], self.match), 18)
+            self.assertEqual(get_player_minutes(self.home_players[0], self.match), 72)
+            self.assertEqual(get_player_minutes(self.home_players[12], self.match), 0)
+
+
+class LineupMinutesTests(TestCase):
+    def setUp(self):
+        from league.models import (
+            Competition, Organization, Player, Season, Stage, Team,
+        )
+        self.org = Organization.objects.create(name="O", slug="o-min")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-min",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-min"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-min"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-min"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
+        self.home_players = [
+            Player.objects.create(
+                team=self.home, first_name=f"H{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+        self.away_players = [
+            Player.objects.create(
+                team=self.away, first_name=f"A{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+
+    def test_starter_full_match(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11], bench=[],
+        )
+        Match.objects.filter(pk=self.match.pk).update(minute=90)
+        self.match.refresh_from_db()
+        self.assertEqual(get_player_minutes(self.home_players[0], self.match), 90)
+
+    def test_starter_subbed_off(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11], bench=[self.home_players[11]],
+        )
+        record_match_event(
+            match=self.match, event_type=MatchEvent.Type.SUBSTITUTION,
+            minute=67, team=self.home,
+            player=self.home_players[0], related_player=self.home_players[11],
+        )
+        self.assertEqual(get_player_minutes(self.home_players[0], self.match), 67)
+
+    def test_unused_bench_zero_minutes(self):
+        submit_lineup(
+            match=self.match, team=self.home,
+            starters=self.home_players[:11], bench=[self.home_players[11]],
+        )
+        self.assertEqual(get_player_minutes(self.home_players[11], self.match), 0)
+
+    def test_no_lineup_zero_minutes(self):
+        self.assertEqual(get_player_minutes(self.home_players[0], self.match), 0)
+
+
+class SubstitutionEdgeCaseTests(TestCase):
+    def setUp(self):
+        from accounts.models import User
+        from league.models import Competition, Organization, Season, Stage, Team, Player
+        self.org = Organization.objects.create(name="O", slug="o-subedge")
+        self.competition = Competition.objects.create(
+            organization=self.org, name="L", slug="l-subedge",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.competition, name="2026", slug="2026-subedge"
+        )
+        self.stage = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        self.home = Team.objects.create(
+            organization=self.org, name="H", slug="h-subedge"
+        )
+        self.away = Team.objects.create(
+            organization=self.org, name="A", slug="a-subedge"
+        )
+        self.competition.teams.add(self.home, self.away)
+
+        positions = ["GK"] * 2 + ["DEF"] * 5 + ["MID"] * 5 + ["ATT"] * 3
+        self.home_players = [
+            Player.objects.create(
+                team=self.home, first_name=f"H{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+        # Away team needs a full 11 for the match to be valid, but for these
+        # tests we only submit the home lineup; away stays as-is.
+        self.away_players = [
+            Player.objects.create(
+                team=self.away, first_name=f"A{i}", position=pos
+            )
+            for i, pos in enumerate(positions)
+        ]
+
+        self.match = create_match(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+
+        # Submit home lineup: starters = [0..10], bench = [11..14]
+        submit_lineup(
+            match=self.match,
+            team=self.home,
+            starters=self.home_players[:11],
+            bench=self.home_players[11:15],
+        )
+
+    def _sub(self, player_off, player_on, minute):
+        record_match_event(
+            match=self.match,
+            event_type=MatchEvent.Type.SUBSTITUTION,
+            minute=minute,
+            team=self.home,
+            player=player_off,
+            related_player=player_on,
+        )
+
+    # -- case 1: coming ON must be on the submitted bench -----------------
+    def test_sub_on_must_be_in_submitted_lineup(self):
+        outsider = Player.objects.create(
+            team=self.home, first_name="Outsider", position="MID"
+        )
+        with self.assertRaises(MatchError):
+            self._sub(self.home_players[0], outsider, 60)
+
+    def test_sub_on_must_be_bench_not_another_starter(self):
+        # home_players[1] is a starter, not on the bench
+        with self.assertRaises(MatchError):
+            self._sub(self.home_players[0], self.home_players[1], 60)
+
+    # -- case 2: coming OFF must currently be active ----------------------
+    def test_cannot_sub_off_player_already_off(self):
+        self._sub(self.home_players[0], self.home_players[11], 60)
+        with self.assertRaises(MatchError):
+            self._sub(self.home_players[0], self.home_players[12], 70)
+
+    # -- case 3: bench player cannot enter twice --------------------------
+    def test_bench_player_cannot_enter_twice(self):
+        self._sub(self.home_players[0], self.home_players[11], 60)
+        with self.assertRaises(MatchError):
+            self._sub(self.home_players[1], self.home_players[11], 70)

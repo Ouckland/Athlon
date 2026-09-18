@@ -4,7 +4,7 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from .models import Competition, Organization, Player, Team
+from .models import Competition, Organization, Player, Team, Season, Stage
 from .services import LeagueError, set_team_captain, set_team_competitions
 
 User = get_user_model()
@@ -392,3 +392,156 @@ class TeamCompetitionOrganizationMatchTests(TestCase):
         )
         set_team_competitions(team=team, competitions=[])
         self.assertEqual(team.competitions.count(), 0)
+
+class SeasonStageTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="stages@example.com", password="StrongPass!23"
+        )
+        self.org = Organization.objects.create(name="Org", slug="org-ss")
+        self.league = Competition.objects.create(
+            organization=self.org, name="League", slug="league-ss",
+            type=Competition.Type.LEAGUE,
+        )
+        self.cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-ss",
+            type=Competition.Type.CUP,
+        )
+
+    # -- competition type ------------------------------------------------
+    def test_competition_defaults_to_league(self):
+        c = Competition.objects.create(organization=self.org, name="X", slug="x-ss")
+        self.assertEqual(c.type, Competition.Type.LEAGUE)
+
+    def test_competition_api_exposes_type(self):
+        resp = self.client.get(
+            reverse("league:competition-detail", args=[self.league.id])
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["type"], "LEAGUE")
+
+    # -- season ----------------------------------------------------------
+    def test_create_season_requires_auth(self):
+        resp = self.client.post(
+            reverse("league:competition-seasons", args=[self.league.id]),
+            {"name": "2026"}, format="json",
+        )
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_create_season_authenticated(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(
+            reverse("league:competition-seasons", args=[self.league.id]),
+            {"name": "2026"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["name"], "2026")
+        self.assertEqual(resp.data["competition"]["id"], self.league.id)
+        self.assertTrue(
+            Season.objects.filter(competition=self.league, name="2026").exists()
+        )
+
+    def test_season_slug_deduped_within_competition(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(
+            reverse("league:competition-seasons", args=[self.league.id]),
+            {"name": "2026"}, format="json",
+        )
+        resp = self.client.post(
+            reverse("league:competition-seasons", args=[self.league.id]),
+            {"name": "2026"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertNotEqual(resp.data["slug"], "2026")
+
+    def test_same_season_slug_across_competitions_ok(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(
+            reverse("league:competition-seasons", args=[self.league.id]),
+            {"name": "2026"}, format="json",
+        )
+        resp = self.client.post(
+            reverse("league:competition-seasons", args=[self.cup.id]),
+            {"name": "2026"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["slug"], "2026")
+
+    def test_season_detail_is_public(self):
+        s = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-pub"
+        )
+        resp = self.client.get(reverse("league:season-detail", args=[s.id]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], s.id)
+
+    # -- stage -----------------------------------------------------------
+    def test_league_accepts_gameweek(self):
+        self.client.force_authenticate(user=self.user)
+        s = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-gw"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "GAMEWEEK", "number": 1}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["kind"], "GAMEWEEK")
+        self.assertEqual(resp.data["season"]["id"], s.id)
+
+    def test_league_rejects_round(self):
+        self.client.force_authenticate(user=self.user)
+        s = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-r"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "ROUND", "number": 1}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cup_accepts_round(self):
+        self.client.force_authenticate(user=self.user)
+        s = Season.objects.create(
+            competition=self.cup, name="2026", slug="2026-cup"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "ROUND", "number": 1}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_cup_rejects_gameweek(self):
+        self.client.force_authenticate(user=self.user)
+        s = Season.objects.create(
+            competition=self.cup, name="2026", slug="2026-cup2"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "GAMEWEEK", "number": 1}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_duplicate_stage_number_rejected(self):
+        self.client.force_authenticate(user=self.user)
+        s = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-dup"
+        )
+        Stage.objects.create(season=s, kind=Stage.Kind.GAMEWEEK, number=1)
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "GAMEWEEK", "number": 1}, format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("detail", resp.data)
+
+    def test_stage_create_requires_auth(self):
+        s = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-noauth"
+        )
+        resp = self.client.post(
+            reverse("league:season-stages", args=[s.id]),
+            {"kind": "GAMEWEEK", "number": 1}, format="json",
+        )
+        self.assertIn(resp.status_code, (401, 403))
