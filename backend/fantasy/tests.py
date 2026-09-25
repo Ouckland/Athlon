@@ -3542,3 +3542,136 @@ class FreeHitLifecycleTests(FantasyTestBase):
                 stage=self.stage, is_free_hit=True
             ).exists()
         )
+
+
+# ---------------------------------------------------------------------------
+# Seed demo command
+# ---------------------------------------------------------------------------
+class SeedDemoCommandTests(TestCase):
+    """
+    Exercises `manage.py seed_demo` as a black box.
+
+    The seed uses `record_match_event`, which registers the fantasy
+    recalculation via `transaction.on_commit()`. Inside a TestCase the outer
+    transaction never commits, so we use `captureOnCommitCallbacks` to make
+    the queued callbacks run at the end of the `with` block.
+    """
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        with self.captureOnCommitCallbacks(execute=True):
+            call_command("seed_demo", *args, stdout=out)
+        return out.getvalue()
+
+    def test_seed_creates_demo_data(self):
+        self._run()
+        self.assertTrue(
+            Organization.objects.filter(slug="funaab-sports-demo").exists()
+        )
+        org = Organization.objects.get(slug="funaab-sports-demo")
+        self.assertEqual(Team.objects.filter(organization=org).count(), 6)
+        self.assertEqual(
+            Player.objects.filter(team__organization=org).count(), 90
+        )
+        self.assertEqual(
+            Match.objects.filter(competition__organization=org).count(), 12
+        )
+
+    def test_seed_creates_fantasy_data(self):
+        self._run()
+        season = Season.objects.get(slug="2026-season")
+        competition = Competition.objects.get(organization__slug="funaab-sports-demo")
+        self.assertEqual(FantasyTeam.objects.filter(season=season).count(), 5)
+        self.assertGreater(
+            FantasyPlayerSelection.objects
+            .filter(fantasy_team__season=season)
+            .count(),
+            0,
+        )
+        self.assertGreater(
+            FantasyPoints.objects.filter(match__competition=competition).count(),
+            0,
+        )
+
+    def test_seed_is_idempotent_without_reset(self):
+        self._run()
+        orgs_before = Organization.objects.count()
+        teams_before = Team.objects.count()
+        self._run()   # no-op, prints warning
+        self.assertEqual(Organization.objects.count(), orgs_before)
+        self.assertEqual(Team.objects.count(), teams_before)
+
+    def test_reset_recreates_clean_data(self):
+        self._run()
+        first_org_id = Organization.objects.get(slug="funaab-sports-demo").id
+        self._run("--reset")
+        new_org_id = Organization.objects.get(slug="funaab-sports-demo").id
+        self.assertNotEqual(first_org_id, new_org_id)
+        self.assertEqual(
+            Organization.objects.filter(slug="funaab-sports-demo").count(), 1
+        )
+        self.assertEqual(
+            Team.objects.filter(
+                organization__slug="funaab-sports-demo"
+            ).count(),
+            6,
+        )
+
+    def test_seeded_squads_are_valid(self):
+        from fantasy.services.teams import _validate_squad
+        self._run()
+        season = Season.objects.get(slug="2026-season")
+        stages = Stage.objects.filter(
+            season=season, kind=Stage.Kind.GAMEWEEK
+        )
+        for ft in FantasyTeam.objects.filter(season=season):
+            for stage in stages:
+                # Validate the permanent squad and any Free Hit squad
+                # separately — they are independent 15-player sets that
+                # may coexist for the same stage.
+                for is_free_hit in (False, True):
+                    sels = ft.selections.filter(
+                        stage=stage, is_free_hit=is_free_hit
+                    )
+                    if not sels.exists():
+                        continue
+                    payload = [
+                        {
+                            "player_id": s.player_id,
+                            "is_starter": s.is_starter,
+                            "is_captain": s.is_captain,
+                        }
+                        for s in sels
+                    ]
+                    _validate_squad(ft, payload)
+
+    def test_seeded_matches_have_events(self):
+        self._run()
+        org = Organization.objects.get(slug="funaab-sports-demo")
+        finished = Match.objects.filter(
+            competition__organization=org,
+            status=Match.Status.FINISHED,
+        )
+        self.assertGreaterEqual(finished.count(), 4)
+        for m in finished:
+            self.assertGreater(m.events.count(), 0)
+
+    def test_seeded_live_state(self):
+        self._run()
+        org = Organization.objects.get(slug="funaab-sports-demo")
+        self.assertEqual(
+            Match.objects.filter(
+                competition__organization=org,
+                status=Match.Status.LIVE,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            Match.objects.filter(
+                competition__organization=org,
+                status=Match.Status.HALFTIME,
+            ).count(),
+            1,
+        )
