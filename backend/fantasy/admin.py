@@ -7,6 +7,7 @@ from .models import (
     FantasyPoints,
     FantasyTeam,
     FantasyPlayerPrice,
+    FantasyChipUse
 )
 
 
@@ -79,4 +80,14 @@ class FantasyTransferAdmin(admin.ModelAdmin):
         "player_in__last_name",
     )
     autocomplete_fields = ("fantasy_team", "player_out", "player_in")
+    readonly_fields = ("created_at",)
+
+
+
+@admin.register(FantasyChipUse)
+class FantasyChipUseAdmin(admin.ModelAdmin):
+    list_display = ("id", "fantasy_team", "chip_type", "stage", "created_at")
+    list_filter = ("chip_type", "stage")
+    search_fields = ("fantasy_team__name",)
+    autocomplete_fields = ("fantasy_team",)
     readonly_fields = ("created_at",)
