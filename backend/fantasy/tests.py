@@ -21,6 +21,7 @@ from .models import (
     FantasyPoints,
     FantasyTeam,
     FantasyTransfer,
+    FantasyChipUse
 )
 from .services import (
     BENCH,
@@ -51,6 +52,9 @@ from .services import (
     transfers_remaining,
     transfers_used,
     validate_player_eligibility,
+    activate_chip,
+    get_scoring_selections,
+    get_current_selections,
 )
 
 User = get_user_model()
@@ -891,12 +895,26 @@ class GroupManagementTests(FantasyTestBase):
             remove_group_member(owner=self.user, group=group, member_user=self.user)
 
     def test_group_stage_leaderboard_scoped_to_members(self):
+        # Owner team gets a starting squad.
         owner_team = self._make_team(name="Owner")
         players, selections = self._make_valid_squad()
         create_starting_squad(
             fantasy_team=owner_team, stage=self.stage, selections=selections
         )
 
+        # Outsider with their own team, NOT in group. Their starting squad
+        # must exist BEFORE the stage locks.
+        outsider = User.objects.create_user(
+            email="outsider@example.com", password="StrongPass!23"
+        )
+        outsider_team = self._make_team(user=outsider, name="Outsider")
+        _, selections2 = self._make_valid_squad(team=self.away)
+        create_starting_squad(
+            fantasy_team=outsider_team, stage=self.stage, selections=selections2
+        )
+
+        # Now lock the stage by moving its match to LIVE, then add the
+        # owner's lineup + goal and recalculate points.
         for p in players[:11]:
             MatchLineup.objects.create(
                 match=self.match, team=self.home, player=p,
@@ -910,15 +928,6 @@ class GroupManagementTests(FantasyTestBase):
             team=self.home, player=players[0],
         )
         calculate_match_points(self.match)
-
-        outsider = User.objects.create_user(
-            email="outsider@example.com", password="StrongPass!23"
-        )
-        outsider_team = self._make_team(user=outsider, name="Outsider")
-        _, selections2 = self._make_valid_squad(team=self.away)
-        create_starting_squad(
-            fantasy_team=outsider_team, stage=self.stage, selections=selections2
-        )
 
         group = create_group(owner=self.user, name="Crew")
         rows = group_stage_leaderboard(
@@ -2794,3 +2803,742 @@ class GameweekPointsAPITests(FantasyTestBase):
         )
         resp = self.client.get(self._url(), {"stage": other_stage.id})
         self.assertEqual(resp.status_code, 400)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Chips
+# ---------------------------------------------------------------------------
+class ChipActivationTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        self.url = reverse("fantasy:team-chips", args=[self.team.id])
+
+    def test_get_chip_state(self):
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        chips = {c["chip"]: c for c in resp.data["chips"]}
+        self.assertEqual(
+            set(chips),
+            {"WILDCARD", "FREE_HIT", "BENCH_BOOST", "TRIPLE_CAPTAIN"},
+        )
+        for c in chips.values():
+            self.assertFalse(c["used"])
+            self.assertIsNone(c["stage_id"])
+
+    def test_activate_wildcard(self):
+        resp = self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        chips = {c["chip"]: c for c in resp.data["chips"]}
+        self.assertTrue(chips["WILDCARD"]["used"])
+        self.assertEqual(chips["WILDCARD"]["stage_id"], self.stage.id)
+
+    def test_activate_bench_boost(self):
+        resp = self.client.post(
+            self.url, {"chip": "BENCH_BOOST", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_activate_triple_captain(self):
+        resp = self.client.post(
+            self.url, {"chip": "TRIPLE_CAPTAIN", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_activate_free_hit_requires_selections(self):
+        resp = self.client.post(
+            self.url, {"chip": "FREE_HIT", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_activate_free_hit_with_selections(self):
+        _, selections = self._make_valid_squad(team=self.away)
+        resp = self.client.post(
+            self.url,
+            {"chip": "FREE_HIT", "stage_id": self.stage.id,
+             "selections": selections},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(
+            self.team.selections.filter(
+                stage=self.stage, is_free_hit=True
+            ).count(),
+            15,
+        )
+
+    def test_anonymous_rejected(self):
+        anon = APIClient()
+        resp = anon.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_non_owner_rejected(self):
+        other = User.objects.create_user(
+            email="other-chip@example.com", password="StrongPass!23"
+        )
+        c = APIClient(); c.force_authenticate(user=other)
+        resp = c.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_invalid_chip_rejected(self):
+        resp = self.client.post(
+            self.url, {"chip": "SUPER_CHIP", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_duplicate_chip_same_season_rejected(self):
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        resp = self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": stage2.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_second_chip_same_gameweek_rejected(self):
+        self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        resp = self.client.post(
+            self.url, {"chip": "BENCH_BOOST", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_round_stage_rejected(self):
+        cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-chip",
+            type=Competition.Type.CUP,
+        )
+        cup_season = Season.objects.create(
+            competition=cup, name="2026", slug="2026-chip"
+        )
+        round_stage = Stage.objects.create(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1
+        )
+        resp = self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": round_stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_wrong_season_rejected(self):
+        other_season = Season.objects.create(
+            competition=self.competition, name="2027", slug="2027-chip"
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
+        )
+        resp = self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": other_stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_locked_gameweek_rejected(self):
+        Match.objects.create(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+            kickoff_at=timezone.now() - timedelta(minutes=10),
+            status=Match.Status.LIVE,
+        )
+        resp = self.client.post(
+            self.url, {"chip": "WILDCARD", "stage_id": self.stage.id},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class WildcardTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+
+    def _outsider(self, position, name, price=Decimal("5.0")):
+        return self._player(self.away, position, name, price=price)
+
+    def test_no_wildcard_limit_still_applies(self):
+        m1 = self._outsider("MID", "M1")
+        m2 = self._outsider("MID", "M2")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=self.players[11], player_in=m1,
+        )
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team, stage=self.stage,
+                player_out=m1, player_in=m2,
+            )
+
+    def test_wildcard_allows_multiple_transfers(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="WILDCARD"
+        )
+        a = self._outsider("MID", "A")
+        b = self._outsider("MID", "B")
+        c = self._outsider("MID", "C")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=self.players[11], player_in=a,
+        )
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=a, player_in=b,
+        )
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=b, player_in=c,
+        )
+        ids = set(
+            self.team.selections.filter(
+                stage=self.stage, is_free_hit=False
+            ).values_list("player_id", flat=True)
+        )
+        self.assertIn(c.id, ids)
+
+    def test_wildcard_transfers_do_not_count(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="WILDCARD"
+        )
+        a = self._outsider("MID", "A")
+        b = self._outsider("MID", "B")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=self.players[11], player_in=a,
+        )
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=a, player_in=b,
+        )
+        self.assertEqual(
+            transfers_used(fantasy_team=self.team, stage=self.stage), 0
+        )
+        # History preserved.
+        self.assertEqual(
+            FantasyTransfer.objects.filter(
+                fantasy_team=self.team, stage=self.stage
+            ).count(),
+            2,
+        )
+
+    def test_wildcard_still_validates_composition(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="WILDCARD"
+        )
+        new_att = self._outsider("ATT", "NewATT")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team, stage=self.stage,
+                player_out=self.players[11],  # MID
+                player_in=new_att,
+            )
+
+    def test_wildcard_cannot_bypass_captain_rule(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="WILDCARD"
+        )
+        new_gk = self._outsider("GK", "NewGK")
+        with self.assertRaises(FantasyError):
+            make_transfer(
+                fantasy_team=self.team, stage=self.stage,
+                player_out=self.players[0],  # captain
+                player_in=new_gk,
+            )
+
+
+class BenchBoostTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        m = Match.objects.create(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away,
+            stage=self.stage,
+        )
+        FantasyPoints.objects.create(match=m, player=self.players[0], points=5)
+        FantasyPoints.objects.create(match=m, player=self.players[11], points=8)
+
+    def test_bench_excluded_by_default(self):
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["starting_xi_points"], 10)  # 5 × 2 captain
+        self.assertEqual(data["bench_points"], 8)
+        self.assertEqual(data["total_points"], 10)
+
+    def test_bench_boost_includes_bench(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="BENCH_BOOST"
+        )
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["total_points"], 18)
+        self.assertEqual(data["active_chip"], "BENCH_BOOST")
+
+    def test_bench_boost_scoped_to_stage(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="BENCH_BOOST"
+        )
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        create_starting_squad(
+            fantasy_team=self.team, stage=stage2, selections=self.valid
+        )
+        data2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
+        self.assertIsNone(data2["active_chip"])
+        self.assertEqual(data2["total_points"], 0)
+
+
+class TripleCaptainTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        m = Match.objects.create(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away, stage=self.stage,
+        )
+        FantasyPoints.objects.create(match=m, player=self.players[0], points=8)
+
+    def test_default_multiplier_is_two(self):
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        cap = next(p for p in data["players"] if p["is_captain"])
+        self.assertEqual(cap["multiplier"], 2)
+        self.assertEqual(cap["points"], 16)
+        self.assertEqual(data["total_points"], 16)
+
+    def test_triple_captain_multiplier_is_three(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="TRIPLE_CAPTAIN"
+        )
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        cap = next(p for p in data["players"] if p["is_captain"])
+        self.assertEqual(cap["multiplier"], 3)
+        self.assertEqual(cap["points"], 24)
+        self.assertEqual(data["total_points"], 24)
+
+    def test_triple_captain_scoped_to_stage(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="TRIPLE_CAPTAIN"
+        )
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        create_starting_squad(
+            fantasy_team=self.team, stage=stage2, selections=self.valid
+        )
+        m2 = Match.objects.create(
+            competition=self.competition,
+            home_team=self.home, away_team=self.away, stage=stage2,
+        )
+        FantasyPoints.objects.create(match=m2, player=self.players[0], points=8)
+        data2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
+        cap2 = next(p for p in data2["players"] if p["is_captain"])
+        self.assertEqual(cap2["multiplier"], 2)
+
+
+class ChipTransferAccountingTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+
+    def _outsider(self, position, name):
+        return self._player(self.away, position, name, price=Decimal("5.0"))
+
+    def test_normal_transfer_counts(self):
+        a = self._outsider("MID", "A")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=self.players[11], player_in=a,
+        )
+        self.assertEqual(
+            transfers_used(fantasy_team=self.team, stage=self.stage), 1
+        )
+        self.assertEqual(
+            transfers_remaining(fantasy_team=self.team, stage=self.stage), 0
+        )
+
+    def test_wildcard_plus_normal_in_same_season(self):
+        # Normal transfer in stage 1.
+        a = self._outsider("MID", "A")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=self.players[11], player_in=a,
+        )
+        # Wildcard + 2 transfers in stage 2.
+        stage2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        create_starting_squad(
+            fantasy_team=self.team, stage=stage2, selections=self.valid
+        )
+        activate_chip(
+            fantasy_team=self.team, stage=stage2, chip_type="WILDCARD"
+        )
+        b = self._outsider("MID", "B")
+        c = self._outsider("MID", "C")
+        make_transfer(
+            fantasy_team=self.team, stage=stage2,
+            player_out=self.players[11], player_in=b,
+        )
+        make_transfer(
+            fantasy_team=self.team, stage=stage2,
+            player_out=b, player_in=c,
+        )
+        self.assertEqual(
+            transfers_used(fantasy_team=self.team, stage=self.stage), 1
+        )
+        self.assertEqual(
+            transfers_used(fantasy_team=self.team, stage=stage2), 0
+        )
+
+
+class ChipSquadResponseTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+
+    def test_squad_response_shows_active_chip(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage, chip_type="WILDCARD"
+        )
+        url = reverse("fantasy:team-squad", args=[self.team.id, self.stage.id])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["active_chip"], "WILDCARD")
+        self.assertEqual(resp.data["transfers_used"], 0)
+
+    def test_fh_squad_via_api(self):
+        _, fh_sel = self._make_valid_squad(team=self.away)
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=fh_sel,
+        )
+        url = reverse("fantasy:team-squad", args=[self.team.id, self.stage.id])
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["active_chip"], "FREE_HIT")
+        returned_ids = {s["player"]["id"] for s in resp.data["starters"]}
+        # Starters should be from the FH squad.
+        fh_ids = {s["player_id"] for s in fh_sel if s["is_starter"]}
+        self.assertEqual(returned_ids, fh_ids)
+class StageFinishedDerivationTests(FantasyTestBase):
+    """
+    Verifies that a gameweek is only considered finished when ALL relevant
+    matches have status FINISHED — not merely the first one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The base fixture creates a default SCHEDULED match on self.stage.
+        # Remove it so each test controls the exact set of matches in the
+        # stage and _stage_finished's behaviour is deterministic.
+        self.match.delete()
+
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        self.fh_players, self.fh_selections = self._make_valid_squad(team=self.away)
+
+    def _match(self, **overrides):
+        defaults = dict(
+            competition=self.competition,
+            home_team=self.home,
+            away_team=self.away,
+            stage=self.stage,
+        )
+        defaults.update(overrides)
+        return Match.objects.create(**defaults)
+
+    def _current_ids(self):
+        return set(
+            get_current_selections(fantasy_team=self.team, stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+
+    def _permanent_ids(self):
+        return {p.id for p in self.players}
+
+    def _fh_ids(self):
+        return {p.id for p in self.fh_players}
+
+    def test_one_finished_one_live_is_not_finished(self):
+        """FH stays current if any relevant match is still in progress."""
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+        self._match(status=Match.Status.LIVE)
+
+        self.assertEqual(self._current_ids(), self._fh_ids())
+
+    def test_all_finished_is_finished(self):
+        """FH reverts to permanent only once every match has finished."""
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+        self._match(status=Match.Status.FINISHED)
+
+        self.assertEqual(self._current_ids(), self._permanent_ids())
+
+    def test_halftime_match_blocks_completion(self):
+        """A single non-finished match keeps the stage open."""
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+        self._match(status=Match.Status.HALFTIME)
+
+        self.assertEqual(self._current_ids(), self._fh_ids())
+
+    def test_postponed_matches_do_not_block_completion(self):
+        """A POSTPONED match is out of scope; stage can still finish."""
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+        self._match(status=Match.Status.POSTPONED)
+
+        self.assertEqual(self._current_ids(), self._permanent_ids())
+
+    def test_cancelled_matches_do_not_block_completion(self):
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+        self._match(status=Match.Status.CANCELLED)
+
+        self.assertEqual(self._current_ids(), self._permanent_ids())
+
+    def test_all_matches_postponed_is_not_finished(self):
+        """No relevant played matches = stage not finished (conservative)."""
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.POSTPONED)
+        self._match(status=Match.Status.CANCELLED)
+
+        self.assertEqual(self._current_ids(), self._fh_ids())
+
+    def test_scoring_selections_ignore_completion_status(self):
+        """
+        Historical scoring always uses the FH squad for a Free Hit stage,
+        even after every match has finished.
+        """
+        activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+        self._match(status=Match.Status.FINISHED)
+
+        scoring_ids = set(
+            get_scoring_selections(fantasy_team=self.team, stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(scoring_ids, self._fh_ids())
+
+
+class FreeHitLifecycleTests(FantasyTestBase):
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(
+            fantasy_team=self.team, stage=self.stage, selections=self.valid
+        )
+        self.fh_players, self.fh_selections = self._make_valid_squad(team=self.away)
+
+    def _activate_fh(self):
+        return activate_chip(
+            fantasy_team=self.team, stage=self.stage,
+            chip_type="FREE_HIT", selections=self.fh_selections,
+        )
+
+    def _finish_gameweek(self):
+        """
+        Mark every existing match in the stage as FINISHED. The base fixture
+        already creates one match on self.stage, so this transitions it to
+        FINISHED rather than adding a new one.
+        """
+        Match.objects.filter(stage=self.stage).update(
+            status=Match.Status.FINISHED
+        )
+
+    def test_fh_requires_permanent_starting_squad(self):
+        # Remove the permanent starting squad that setUp created.
+        self.team.selections.filter(
+            stage=self.stage, is_free_hit=False
+        ).delete()
+
+        with self.assertRaises(FantasyError) as ctx:
+            activate_chip(
+                fantasy_team=self.team, stage=self.stage,
+                chip_type="FREE_HIT", selections=self.fh_selections,
+            )
+        self.assertIn("starting squad", str(ctx.exception).lower())
+
+    def test_fh_stores_temporary_rows_only(self):
+        self._activate_fh()
+        fh_ids = set(
+            self.team.selections.filter(stage=self.stage, is_free_hit=True)
+            .values_list("player_id", flat=True)
+        )
+        perm_ids = set(
+            self.team.selections.filter(stage=self.stage, is_free_hit=False)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(fh_ids, {p.id for p in self.fh_players})
+        self.assertEqual(perm_ids, {p.id for p in self.players})
+
+    def test_current_squad_is_fh_while_unfinished(self):
+        self._activate_fh()
+        ids = set(
+            get_current_selections(fantasy_team=self.team, stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.fh_players})
+
+    def test_current_squad_reverts_after_finish(self):
+        self._activate_fh()
+        self._finish_gameweek()
+        ids = set(
+            get_current_selections(fantasy_team=self.team, stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.players})
+
+    def test_scoring_squad_is_fh_even_after_finish(self):
+        self._activate_fh()
+        self._finish_gameweek()
+        ids = set(
+            get_scoring_selections(fantasy_team=self.team, stage=self.stage)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.fh_players})
+
+    def test_historical_points_use_fh_squad(self):
+        self._activate_fh()
+        # `_finish_gameweek` marks the existing stage match FINISHED.
+        self._finish_gameweek()
+        m = Match.objects.filter(stage=self.stage).first()
+
+        fh_captain_id = self.fh_selections[0]["player_id"]
+        FantasyPoints.objects.create(
+            match=m, player_id=fh_captain_id, points=10
+        )
+        data = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
+        self.assertEqual(data["total_points"], 20)  # captain × 2
+
+    def test_fh_transfer_modifies_fh_rows_only(self):
+        self._activate_fh()
+        out = self.fh_players[11]
+        incoming = self._player(self.away, "MID", "FHNew")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=out, player_in=incoming,
+        )
+        fh_ids = set(
+            self.team.selections.filter(stage=self.stage, is_free_hit=True)
+            .values_list("player_id", flat=True)
+        )
+        perm_ids = set(
+            self.team.selections.filter(stage=self.stage, is_free_hit=False)
+            .values_list("player_id", flat=True)
+        )
+        self.assertIn(incoming.id, fh_ids)
+        self.assertNotIn(incoming.id, perm_ids)
+
+    def test_fh_transfers_do_not_count_toward_limit(self):
+        self._activate_fh()
+        out = self.fh_players[11]
+        a = self._player(self.away, "MID", "A")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=out, player_in=a,
+        )
+        b = self._player(self.away, "MID", "B")
+        make_transfer(
+            fantasy_team=self.team, stage=self.stage,
+            player_out=a, player_in=b,
+        )
+        self.assertEqual(
+            transfers_used(fantasy_team=self.team, stage=self.stage), 0
+        )
+        self.assertEqual(
+            FantasyTransfer.objects.filter(
+                fantasy_team=self.team, stage=self.stage
+            ).count(),
+            2,
+        )
+
+    def test_invalid_fh_squad_rejected_atomically(self):
+        bad = self.fh_selections[:-1]
+        with self.assertRaises(FantasyError):
+            activate_chip(
+                fantasy_team=self.team, stage=self.stage,
+                chip_type="FREE_HIT", selections=bad,
+            )
+        self.assertFalse(
+            FantasyChipUse.objects.filter(
+                fantasy_team=self.team, stage=self.stage
+            ).exists()
+        )
+        self.assertFalse(
+            self.team.selections.filter(
+                stage=self.stage, is_free_hit=True
+            ).exists()
+        )

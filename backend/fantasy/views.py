@@ -20,6 +20,9 @@ from .serializers import (
     FantasyTransferSerializer,
     TransferCreateSerializer,
     GameweekPointsSerializer,
+    ChipActivateSerializer,
+    ChipStateSerializer,
+
 )
 
 from .services import (
@@ -40,8 +43,13 @@ from .services import (
     transfers_remaining,
     transfers_used,
     get_gameweek_points,
+    activate_chip,
+    chip_state_for_team,
+    get_active_chip,
+    get_current_selections,
 
 )
+
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +57,7 @@ from .services import (
 # ---------------------------------------------------------------------------
 def _serialize_squad(team, stage):
     selections = list(
-        team.selections.filter(stage=stage)
+        get_current_selections(fantasy_team=team, stage=stage)
         .select_related("player", "player__team", "player__fantasy_price")
     )
     starters = [s for s in selections if s.is_starter]
@@ -62,6 +70,8 @@ def _serialize_squad(team, stage):
     except Exception:
         total_cost = None
 
+    active = get_active_chip(fantasy_team=team, stage=stage)
+
     return {
         "stage": {
             "id": stage.id,
@@ -71,6 +81,7 @@ def _serialize_squad(team, stage):
             "name": stage.name,
         },
         "locked": is_gameweek_locked(stage),
+        "active_chip": active.chip_type if active else None,
         "starters": FantasyPlayerSelectionSerializer(starters, many=True).data,
         "bench": FantasyPlayerSelectionSerializer(bench, many=True).data,
         "captain_id": captain.player_id if captain else None,
@@ -439,3 +450,36 @@ def team_points_view(request, team_id):
         )
 
     return Response(GameweekPointsSerializer(data).data)
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def team_chips_view(request, team_id):
+    team = _my_team_or_404(request, team_id)
+
+    if request.method == "GET":
+        return Response({"chips": chip_state_for_team(fantasy_team=team)})
+
+    serializer = ChipActivateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    stage = get_object_or_404(
+        Stage.objects.select_related("season"), pk=data["stage_id"]
+    )
+
+    try:
+        activate_chip(
+            fantasy_team=team,
+            stage=stage,
+            chip_type=data["chip"],
+            selections=data.get("selections"),
+        )
+    except FantasyError as exc:
+        return Response(
+            {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+        )
+
+    return Response(
+        {"chips": chip_state_for_team(fantasy_team=team)},
+        status=status.HTTP_201_CREATED,
+    )

@@ -8,6 +8,7 @@ from .models import (
     FantasyGroupMembership,
     FantasyPlayerSelection,
     FantasyTeam,
+    FantasyChipUse,
 )
 
 User = get_user_model()
@@ -213,3 +214,16 @@ class GameweekPointsSerializer(serializers.Serializer):
     starting_xi_points = serializers.IntegerField()
     bench_points = serializers.IntegerField()
     players = PlayerPointsRowSerializer(many=True)
+
+
+
+class ChipStateSerializer(serializers.Serializer):
+    chip = serializers.ChoiceField(choices=FantasyChipUse.Chip.choices)
+    used = serializers.BooleanField()
+    stage_id = serializers.IntegerField(allow_null=True)
+
+
+class ChipActivateSerializer(serializers.Serializer):
+    chip = serializers.ChoiceField(choices=FantasyChipUse.Chip.choices)
+    stage_id = serializers.IntegerField()
+    selections = SquadSelectionWriteSerializer(many=True, required=False)

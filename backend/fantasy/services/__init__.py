@@ -4,6 +4,17 @@ from .groups import (
     leave_group,
     remove_group_member,
 )
+
+from .chips import (
+    activate_chip,
+    chip_state_for_team,
+    get_active_chip,
+    get_current_selections,
+    get_scoring_selections,
+    has_chip_been_used,
+    is_chip_active,
+)
+
 from .transfers import (
     make_transfer,
     transfers_remaining,

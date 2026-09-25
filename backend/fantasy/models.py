@@ -40,41 +40,6 @@ class FantasyTeam(models.Model):
         return f"{self.name} ({self.user.email} · {self.competition.name} {self.season.name})"
 
 
-class FantasyPlayerSelection(models.Model):
-    fantasy_team = models.ForeignKey(
-        FantasyTeam, on_delete=models.CASCADE, related_name="selections"
-    )
-    stage = models.ForeignKey(
-        "league.Stage",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="fantasy_selections",
-    )
-    player = models.ForeignKey(
-        "league.Player",
-        on_delete=models.CASCADE,
-        related_name="fantasy_selections",
-    )
-    is_starter = models.BooleanField(default=False)
-    is_captain = models.BooleanField(default=False)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["fantasy_team", "stage", "player"],
-                name="uniq_player_per_team_stage",
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["fantasy_team", "stage", "is_starter"]),
-            models.Index(fields=["fantasy_team", "stage", "is_captain"]),
-        ]
-
-    def __str__(self):
-        role = "C" if self.is_captain else ("S" if self.is_starter else "B")
-        return f"{self.player} [{role}] stage={self.stage_id}"
 
 
 class FantasyGroup(models.Model):
@@ -180,42 +145,62 @@ class FantasyPlayerPrice(models.Model):
     def __str__(self):
         return f"{self.player} = {self.price}"
 
-
-class FantasyTransfer(models.Model):
-    """
-    An audit record of one transfer made by a fantasy team in a gameweek.
-
-    - player_out must have been in the squad before the transfer
-    - player_in takes the same slot (starter/bench) as player_out
-    - player_out cannot be the captain (captain must be changed first)
-    """
-
+class FantasyPlayerSelection(models.Model):
     fantasy_team = models.ForeignKey(
-        FantasyTeam,
-        on_delete=models.CASCADE,
-        related_name="transfers",
+        FantasyTeam, on_delete=models.CASCADE, related_name="selections"
     )
     stage = models.ForeignKey(
-        "league.Stage",
-        on_delete=models.CASCADE,
-        related_name="fantasy_transfers",
+        "league.Stage", on_delete=models.CASCADE, related_name="fantasy_selections"
+    )
+    player = models.ForeignKey(
+        "league.Player", on_delete=models.CASCADE, related_name="fantasy_selections"
+    )
+    is_starter = models.BooleanField(default=False)
+    is_captain = models.BooleanField(default=False)
+    is_free_hit = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["fantasy_team", "stage", "player", "is_free_hit"],
+                name="uniq_player_per_team_stage_and_hit",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["fantasy_team", "stage", "is_free_hit", "is_starter"]),
+            models.Index(fields=["fantasy_team", "stage", "is_free_hit", "is_captain"]),
+        ]
+
+    def __str__(self):
+        role = "C" if self.is_captain else ("S" if self.is_starter else "B")
+        fh = " [FH]" if self.is_free_hit else ""
+        return f"{self.player} [{role}]{fh} stage={self.stage_id}"
+
+
+class FantasyTransfer(models.Model):
+    fantasy_team = models.ForeignKey(
+        FantasyTeam, on_delete=models.CASCADE, related_name="transfers"
+    )
+    stage = models.ForeignKey(
+        "league.Stage", on_delete=models.CASCADE, related_name="fantasy_transfers"
     )
     player_out = models.ForeignKey(
-        "league.Player",
-        on_delete=models.PROTECT,
+        "league.Player", on_delete=models.PROTECT,
         related_name="fantasy_transfers_out",
     )
     player_in = models.ForeignKey(
-        "league.Player",
-        on_delete=models.PROTECT,
+        "league.Player", on_delete=models.PROTECT,
         related_name="fantasy_transfers_in",
     )
+    counts_toward_limit = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["fantasy_team", "stage"]),
+            models.Index(fields=["fantasy_team", "stage", "counts_toward_limit"]),
         ]
         constraints = [
             models.CheckConstraint(
@@ -225,4 +210,46 @@ class FantasyTransfer(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.player_out} → {self.player_in} ({self.fantasy_team.name}, GW{self.stage.number})"
+        marker = "" if self.counts_toward_limit else " (chip)"
+        return f"{self.player_out} → {self.player_in}{marker} ({self.fantasy_team.name}, stage {self.stage_id})"
+
+
+class FantasyChipUse(models.Model):
+    """
+    Records one chip use by a fantasy team for a specific gameweek.
+    Constraints: one use of each chip per season; one chip per gameweek.
+    """
+
+    class Chip(models.TextChoices):
+        WILDCARD = "WILDCARD", "Wildcard"
+        FREE_HIT = "FREE_HIT", "Free Hit"
+        BENCH_BOOST = "BENCH_BOOST", "Bench Boost"
+        TRIPLE_CAPTAIN = "TRIPLE_CAPTAIN", "Triple Captain"
+
+    fantasy_team = models.ForeignKey(
+        FantasyTeam, on_delete=models.CASCADE, related_name="chip_uses"
+    )
+    season = models.ForeignKey(
+        "league.Season", on_delete=models.CASCADE, related_name="chip_uses"
+    )
+    stage = models.ForeignKey(
+        "league.Stage", on_delete=models.CASCADE, related_name="chip_uses"
+    )
+    chip_type = models.CharField(max_length=20, choices=Chip.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["fantasy_team", "season", "chip_type"],
+                name="uniq_chip_per_team_season",
+            ),
+            models.UniqueConstraint(
+                fields=["fantasy_team", "stage"],
+                name="uniq_chip_per_team_stage",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.chip_type} for {self.fantasy_team.name} @ stage {self.stage_id}"

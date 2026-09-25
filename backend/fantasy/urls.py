@@ -42,4 +42,9 @@ urlpatterns = [
         views.team_points_view,
         name="team-points",
     ),
+        path(
+        "teams/<int:team_id>/chips/",
+        views.team_chips_view,
+        name="team-chips",
+    ),
 ]
