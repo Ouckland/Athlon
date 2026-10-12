@@ -1,0 +1,41 @@
+{
+  "name": "Athlon",
+  "short_name": "Athlon",
+  "description": "Premium football live scores and fantasy football",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0A0F0C",
+  "theme_color": "#0A0F0C",
+  "categories": ["sports", "entertainment"],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Fixtures",
+      "short_name": "Fixtures",
+      "description": "Today's matches",
+      "url": "/fixtures",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Fantasy",
+      "short_name": "Fantasy",
+      "description": "My fantasy team",
+      "url": "/app/fantasy",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
