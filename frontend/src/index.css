@@ -1,0 +1,149 @@
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700;800;900&family=Barlow:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  /* ── Foundation — pitch-dark green, alive, distinctive ─── */
+  --color-bg:        #0A0F0C;   /* very dark with green undertone */
+  --color-surface-1: #111812;   /* card / panel */
+  --color-surface-2: #162019;   /* elevated / header */
+  --color-surface-3: #1E2A20;   /* selected / interactive */
+  --color-border:    #243028;   /* hairline */
+  --color-border-hi: #344A38;   /* active / hover */
+
+  /* ── Athlon brand — vivid football green ──────────────── */
+  --color-athlon:    #22C55E;   /* emerald — pitch green, unmistakably football */
+  --color-athlon-lo: rgba(34,197,94,0.12);
+
+  /* ── Status ───────────────────────────────────────────── */
+  --color-live:      #EF4444;
+  --color-live-lo:   rgba(239,68,68,0.1);
+  --color-halftime:  #FBBF24;
+  --color-finished:  #4B6A54;
+  --color-win:       #22C55E;
+  --color-draw:      #FBBF24;
+  --color-loss:      #EF4444;
+
+  /* ── Text ─────────────────────────────────────────────── */
+  --color-text-1: #E2F2E8;
+  --color-text-2: #7A9E80;
+  --color-text-3: #40604A;
+
+  /* ── Fonts ────────────────────────────────────────────── */
+  --font-sans:      'Inter', system-ui, sans-serif;
+  --font-condensed: 'Barlow Condensed', 'Barlow', system-ui, sans-serif;
+  --font-mono:      'DM Mono', 'JetBrains Mono', monospace;
+
+  /* ── Radii ────────────────────────────────────────────── */
+  --radius-card:  6px;
+  --radius-badge: 3px;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #243028 transparent;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text-1);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+}
+
+.app-content {
+  padding-bottom: calc(80px + env(safe-area-inset-bottom));
+}
+
+@media (min-width: 768px) {
+  .app-content {
+    padding-bottom: 24px;
+  }
+}
+
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 2px; }
+
+/* ── Animations ─────────────────────────────────────────── */
+
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.4; transform: scale(0.8); }
+}
+
+@keyframes live-ring {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.8); opacity: 0; }
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ── Football pitch animation ─────────────────────────── */
+@keyframes pitch-scroll {
+  0%   { transform: translateY(0); }
+  100% { transform: translateY(80px); }
+}
+
+@keyframes ball-float {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  33%       { transform: translateY(-8px) rotate(60deg); }
+  66%       { transform: translateY(4px) rotate(120deg); }
+}
+
+@keyframes glow-pulse {
+  0%, 100% { opacity: 0.6; }
+  50%       { opacity: 1; }
+}
+
+@keyframes score-flash {
+  0%   { transform: scale(1);    color: inherit; }
+  20%  { transform: scale(1.18); color: #22C55E; }
+  60%  { transform: scale(1.06); color: #A3E6BE; }
+  100% { transform: scale(1);    color: inherit; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.animate-fade-up    { animation: fade-up 0.3s ease both; }
+.animate-fade-in    { animation: fade-in 0.2s ease both; }
+.animate-slide-in   { animation: slide-in-right 0.25s ease both; }
+.animate-live-pulse { animation: live-pulse 1.6s ease-in-out infinite; }
+.animate-live-ring  { animation: live-ring 1.6s ease-out infinite; }
+.animate-ball-float { animation: ball-float 4s ease-in-out infinite; }
+.animate-glow         { animation: glow-pulse 2s ease-in-out infinite; }
+.animate-score-flash  { animation: score-flash 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* ── Utilities ──────────────────────────────────────────── */
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar { display: none; }
+
+.match-row-hover { transition: background-color 0.1s ease; }
+.match-row-hover:hover { background-color: var(--color-surface-2); }
+
+.live-stripe { border-left: 2px solid var(--color-live); }
