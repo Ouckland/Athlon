@@ -172,38 +172,47 @@ def is_gameweek_locked(stage):
         .exists()
     )
 
-# ---------------------------------------------------------------------------
-# Squad
-# ---------------------------------------------------------------------------
-def create_starting_squad(*, fantasy_team, stage, selections):
+def base_stage_for_team(fantasy_team):
     """
-    Create the initial squad for a fantasy team and gameweek.
-
-    Can only be called once per (fantasy_team, stage).
-
-    Rules:
-      - stage must be a valid GAMEWEEK for the fantasy team
-      - gameweek must not be locked
-      - no squad may already exist for this (fantasy_team, stage)
-      - the squad must pass all composition / budget / captain / eligibility
-        rules in _validate_squad()
-
-    Does NOT consume a transfer. Does NOT delete or replace an existing
-    squad — the previous incarnation of this function did, and that path
-    has been removed.
+    The stage that anchors a fantasy team's squad. This is the first
+    GAMEWEEK of the team's season.
     """
-    validate_stage_for_fantasy(fantasy_team=fantasy_team, stage=stage)
-    if is_gameweek_locked(stage):
+    stage = (
+        Stage.objects
+        .filter(season=fantasy_team.season, kind=Stage.Kind.GAMEWEEK)
+        .order_by("number")
+        .first()
+    )
+    if stage is None:
+        raise FantasyError(
+            "This season has no gameweeks; cannot create a starting squad."
+        )
+    return stage
+
+
+def create_starting_squad(*, fantasy_team, selections):
+    """
+    Create the base squad for a fantasy team.
+
+    Can only be called once per fantasy team. Writes to the base stage
+    (first GAMEWEEK of the season). The squad automatically carries
+    forward to every future gameweek.
+
+    Does NOT consume a transfer.
+    """
+    base_stage = base_stage_for_team(fantasy_team)
+
+    if is_gameweek_locked(base_stage):
         raise FantasyError(
             "This gameweek is locked; the starting squad can no longer be created."
         )
 
     if FantasyPlayerSelection.objects.filter(
-        fantasy_team=fantasy_team, stage=stage
+        fantasy_team=fantasy_team, is_free_hit=False
     ).exists():
         raise FantasyError(
-            "A starting squad already exists for this gameweek. "
-            "Use a transfer to change players."
+            "A starting squad already exists for this fantasy team. "
+            "Use transfers to change players."
         )
 
     _validate_squad(fantasy_team, selections)
@@ -213,10 +222,11 @@ def create_starting_squad(*, fantasy_team, stage, selections):
             [
                 FantasyPlayerSelection(
                     fantasy_team=fantasy_team,
-                    stage=stage,
+                    stage=base_stage,
                     player_id=s["player_id"],
                     is_starter=bool(s["is_starter"]),
                     is_captain=bool(s.get("is_captain", False)),
+                    is_free_hit=False,
                 )
                 for s in selections
             ]

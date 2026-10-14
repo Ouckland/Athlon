@@ -12,6 +12,8 @@ backend/.env
 .vscode/
 .idea/
 
+.figma/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -45,4 +45,9 @@ urlpatterns = [
         views.team_manager_detail_view,
         name="team-manager-detail",
     ),
+        path(
+        "competitions/<int:competition_id>/standings/",
+        views.competition_standings_view,
+        name="competition-standings",
+    ),
 ]

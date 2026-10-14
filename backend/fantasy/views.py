@@ -4,6 +4,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from fantasy.services.teams import base_stage_for_team
 from league.models import Competition, Player, Season, Stage
 
 from .constants import FREE_TRANSFER_LIMIT
@@ -56,15 +57,30 @@ from .services import (
 # Helpers
 # ---------------------------------------------------------------------------
 def _serialize_squad(team, stage):
+    from .services import get_current_selections, get_active_chip, squad_total_cost
+    from .models import FantasyChipUse, FantasyPlayerSelection
+
     selections = list(
         get_current_selections(fantasy_team=team, stage=stage)
         .select_related("player", "player__team", "player__fantasy_price")
     )
+
+    # Is this squad carried forward from an earlier gameweek?
+    # True when: there are selections to show, but the current stage has no
+    # permanent rows of its own, and no Free Hit is active for this stage.
+    has_explicit_rows = FantasyPlayerSelection.objects.filter(
+        fantasy_team=team, stage=stage, is_free_hit=False
+    ).exists()
+    fh_active = FantasyChipUse.objects.filter(
+        fantasy_team=team, stage=stage,
+        chip_type=FantasyChipUse.Chip.FREE_HIT,
+    ).exists()
+    carried_forward = bool(selections) and not has_explicit_rows and not fh_active
+
     starters = [s for s in selections if s.is_starter]
     bench = [s for s in selections if not s.is_starter]
     captain = next((s for s in selections if s.is_captain), None)
 
-    from .services import squad_total_cost
     try:
         total_cost = squad_total_cost(selections)
     except Exception:
@@ -82,6 +98,7 @@ def _serialize_squad(team, stage):
         },
         "locked": is_gameweek_locked(stage),
         "active_chip": active.chip_type if active else None,
+        "carried_forward": carried_forward,
         "starters": FantasyPlayerSelectionSerializer(starters, many=True).data,
         "bench": FantasyPlayerSelectionSerializer(bench, many=True).data,
         "captain_id": captain.player_id if captain else None,
@@ -211,14 +228,10 @@ def team_squad_view(request, team_id, stage_id):
 
     return Response(_serialize_squad(team, stage))
 
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def team_starting_squad_view(request, team_id, stage_id):
+def team_starting_squad_view(request, team_id):
     team = _my_team_or_404(request, team_id)
-    stage = get_object_or_404(
-        Stage.objects.select_related("season"), pk=stage_id
-    )
 
     serializer = SquadWriteSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -226,7 +239,6 @@ def team_starting_squad_view(request, team_id, stage_id):
     try:
         create_starting_squad(
             fantasy_team=team,
-            stage=stage,
             selections=serializer.validated_data["selections"],
         )
     except FantasyError as exc:
@@ -235,7 +247,8 @@ def team_starting_squad_view(request, team_id, stage_id):
         )
 
     return Response(
-        _serialize_squad(team, stage), status=status.HTTP_201_CREATED
+        _serialize_squad(team, base_stage_for_team(team)),
+        status=status.HTTP_201_CREATED,
     )
 
 

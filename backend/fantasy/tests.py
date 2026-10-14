@@ -13,6 +13,14 @@ from matches.models import Match, MatchEvent, MatchLineup
 from matches.services import create_match
 from matches.services.lineup import submit_lineup
 
+from fantasy.models import FantasyChipUse, FantasyPlayerSelection, FantasyTeam
+from fantasy.services import (
+    create_starting_squad,
+    get_current_selections,
+    get_scoring_selections,
+    make_transfer,
+    FantasyError,
+)
 from .constants import DEFAULT_STARTING_BUDGET, MAX_PLAYER_PRICE
 from .models import (
     FantasyGroupMembership,
@@ -176,9 +184,6 @@ class MultiTeamTests(FantasyTestBase):
             )
 
 
-# ---------------------------------------------------------------------------
-# Squad validation
-# ---------------------------------------------------------------------------
 class SquadValidationTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
@@ -186,7 +191,7 @@ class SquadValidationTests(FantasyTestBase):
         self.players, self.valid = self._make_valid_squad()
 
     def test_valid_squad_accepted(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
         sels = self.team.selections.filter(stage=self.stage)
         self.assertEqual(sels.count(), SQUAD_SIZE)
         self.assertEqual(sels.filter(is_starter=True).count(), STARTERS)
@@ -195,14 +200,16 @@ class SquadValidationTests(FantasyTestBase):
 
     def test_wrong_total_count_rejected(self):
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid[:-1])
+            create_starting_squad(
+                fantasy_team=self.team, selections=self.valid[:-1]
+            )
 
     def test_wrong_gk_count_rejected(self):
         extra_att = self._player(self.home, "ATT", "ExtraATT")
         bad = [s for s in self.valid if s["player_id"] != self.players[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_wrong_def_count_rejected(self):
         extra_att = self._player(self.home, "ATT", "ExtraATT")
@@ -210,7 +217,7 @@ class SquadValidationTests(FantasyTestBase):
         bad = [s for s in self.valid if s["player_id"] != defs[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_wrong_mid_count_rejected(self):
         extra_att = self._player(self.home, "ATT", "ExtraATT")
@@ -218,7 +225,7 @@ class SquadValidationTests(FantasyTestBase):
         bad = [s for s in self.valid if s["player_id"] != mids[0].id]
         bad.append({"player_id": extra_att.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_wrong_att_count_rejected(self):
         extra_def = self._player(self.home, "DEF", "ExtraDEF")
@@ -226,30 +233,30 @@ class SquadValidationTests(FantasyTestBase):
         bad = [s for s in self.valid if s["player_id"] != atts[0].id]
         bad.append({"player_id": extra_def.id, "is_starter": False, "is_captain": False})
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_wrong_starter_count_rejected(self):
         bad = [dict(s) for s in self.valid]
         bad[0]["is_starter"] = False
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_wrong_bench_count_rejected(self):
         bad = [dict(s) for s in self.valid]
         bad[-1]["is_starter"] = True
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_no_captain_rejected(self):
         bad = [{**s, "is_captain": False} for s in self.valid]
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_multiple_captains_rejected(self):
         bad = [dict(s) for s in self.valid]
         bad[1]["is_captain"] = True
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_captain_on_bench_rejected(self):
         bad = [dict(s) for s in self.valid]
@@ -258,13 +265,13 @@ class SquadValidationTests(FantasyTestBase):
         bench_sel = next(s for s in bad if not s["is_starter"])
         bench_sel["is_captain"] = True
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_duplicate_player_rejected(self):
         bad = [dict(s) for s in self.valid]
         bad[-1]["player_id"] = bad[0]["player_id"]
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
     def test_ineligible_player_rejected(self):
         other_org = Organization.objects.create(name="OtherOrg", slug="other-org")
@@ -281,36 +288,27 @@ class SquadValidationTests(FantasyTestBase):
         bad = [dict(s) for s in self.valid]
         bad[-1]["player_id"] = outsider.id
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=bad)
+            create_starting_squad(fantasy_team=self.team, selections=bad)
 
-    def test_stage_from_other_season_rejected(self):
-        season2 = Season.objects.create(
-            competition=self.competition, name="2027", slug="2027"
-        )
-        stage2 = Stage.objects.create(
-            season=season2, kind=Stage.Kind.GAMEWEEK, number=1
+    def test_second_starting_squad_rejected(self):
+        # Phase 6: a starting squad can only be created once per fantasy team.
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE
         )
         with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
+            create_starting_squad(fantasy_team=self.team, selections=self.valid)
 
-    def test_duplicate_starting_squad_rejected(self):
-        # Phase 4.5: a starting squad can only be created once per gameweek.
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
-        self.assertEqual(self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE)
-        with self.assertRaises(FantasyError):
-            create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
-
-    def test_two_stages_coexist(self):
-        stage2 = Stage.objects.create(
-            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+    def test_base_squad_written_to_first_gameweek(self):
+        # Phase 6: the base squad lives on the first GAMEWEEK of the season.
+        # self.stage was created with number=1, so it is the base stage.
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
+        self.assertEqual(
+            self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE
         )
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
-        create_starting_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
-        self.assertEqual(self.team.selections.filter(stage=self.stage).count(), SQUAD_SIZE)
-        self.assertEqual(self.team.selections.filter(stage=stage2).count(), SQUAD_SIZE)
 
     def test_player_uniqueness_enforced_at_db(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 FantasyPlayerSelection.objects.create(
@@ -671,7 +669,7 @@ class LeaderboardTests(FantasyTestBase):
         self.team = self._make_team(name="Alpha")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
         for p in self.players[:11]:
@@ -731,9 +729,13 @@ class LeaderboardTests(FantasyTestBase):
         after = fantasy_team_total_points(self.team, stage=self.stage)
         self.assertEqual(before, after)
 
-
 class StageScopingTests(FantasyTestBase):
     def test_points_do_not_leak_across_stages(self):
+        """
+        A team's points for one stage come from its resolved squad for
+        that stage. Scoring for stage2, where the team didn't change
+        anything, must reflect only stage2's matches.
+        """
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
@@ -746,6 +748,16 @@ class StageScopingTests(FantasyTestBase):
             self._player(self.home, pos, f"H{i}")
             for i, pos in enumerate(POSITIONS_15)
         ]
+
+        # Base squad on stage1.
+        team = self._make_team(name="T")
+        selections = [
+            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+            for i, p in enumerate(players)
+        ]
+        create_starting_squad(fantasy_team=team, selections=selections)
+
+        # Points only in stage1's match.
         MatchLineup.objects.create(
             match=self.match, team=self.home, player=players[0],
             is_starter=True, subbed_off_minute=90,
@@ -759,33 +771,34 @@ class StageScopingTests(FantasyTestBase):
         )
         calculate_match_points(self.match)
 
-        team = self._make_team(name="T")
-        selections = [
-            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
-            for i, p in enumerate(players)
-        ]
-        create_starting_squad(fantasy_team=team, stage=stage2, selections=selections)
-
+        # Stage2 leaderboard: no matches have played in stage2, so 0.
         s2_rows = stage_leaderboard(
             competition=self.competition, season=self.season, stage=stage2,
         )
         self.assertEqual(s2_rows[0]["total_points"], 0)
 
     def test_points_do_not_leak_across_seasons(self):
+        """
+        A team in season2 gets no points from a match in season1's stage.
+        """
         season2 = Season.objects.create(
             competition=self.competition, name="2027", slug="2027-lk"
         )
-        stage2 = Stage.objects.create(
+        Stage.objects.create(
             season=season2, kind=Stage.Kind.GAMEWEEK, number=1
         )
         team2 = self._make_team(name="S2", season=season2)
-        _, selections = self._make_valid_squad()
-        create_starting_squad(fantasy_team=team2, stage=stage2, selections=selections)
 
+        # Base squad for team2 uses the away team's players (they're in
+        # the same competition so eligibility holds).
+        _, selections = self._make_valid_squad(team=self.away)
+        create_starting_squad(fantasy_team=team2, selections=selections)
+
+        # Give a player in season1's stage some points.
         players = [Player.objects.get(pk=s["player_id"]) for s in selections]
         for p in players[:11]:
             MatchLineup.objects.create(
-                match=self.match, team=self.home, player=p,
+                match=self.match, team=self.away, player=p,
                 is_starter=True, subbed_off_minute=90,
             )
         Match.objects.filter(pk=self.match.pk).update(
@@ -793,10 +806,11 @@ class StageScopingTests(FantasyTestBase):
         )
         MatchEvent.objects.create(
             match=self.match, type=MatchEvent.Type.GOAL, minute=10,
-            team=self.home, player=players[0],
+            team=self.away, player=players[0],
         )
         calculate_match_points(self.match)
 
+        # season2 leaderboard: 0 because the players' points are in season1.
         rows = season_leaderboard(competition=self.competition, season=season2)
         self.assertEqual(rows[0]["total_points"], 0)
 
@@ -959,10 +973,8 @@ class FantasyTeamAPITests(FantasyAPITestBase):
     def _squad_url(self, team_id, stage_id):
         return reverse("fantasy:team-squad", args=[team_id, stage_id])
 
-    def _starting_squad_url(self, team_id, stage_id):
-        return reverse(
-            "fantasy:team-starting-squad", args=[team_id, stage_id]
-        )
+    def _starting_squad_url(self, team_id):
+        return reverse("fantasy:team-starting-squad", args=[team_id])
 
     # -- auth -------------------------------------------------------------
     def test_anonymous_cannot_list_teams(self):
@@ -1068,7 +1080,7 @@ class FantasyTeamAPITests(FantasyAPITestBase):
         tid = resp.data["id"]
         players, selections = self._make_valid_squad()
         resp = self.client.post(
-            self._starting_squad_url(tid, self.stage.id),
+            self._starting_squad_url(tid),
             {"selections": selections}, format="json",
         )
         self.assertEqual(resp.status_code, 201)
@@ -1086,12 +1098,12 @@ class FantasyTeamAPITests(FantasyAPITestBase):
         tid = resp.data["id"]
         _, selections = self._make_valid_squad()
         resp = self.client.post(
-            self._starting_squad_url(tid, self.stage.id),
+            self._starting_squad_url(tid),
             {"selections": selections[:-1]}, format="json",
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_starting_squad_stage_outside_team_season_rejected(self):
+    def test_second_starting_squad_rejected(self):
         resp = self.client.post(
             self._team_list_url(),
             {"name": "T", "competition_id": self.competition.id,
@@ -1099,19 +1111,17 @@ class FantasyTeamAPITests(FantasyAPITestBase):
             format="json",
         )
         tid = resp.data["id"]
-        season2 = Season.objects.create(
-            competition=self.competition, name="2027", slug="2027-sq"
-        )
-        stage2 = Stage.objects.create(
-            season=season2, kind=Stage.Kind.GAMEWEEK, number=1
-        )
         _, selections = self._make_valid_squad()
-        resp = self.client.post(
-            self._starting_squad_url(tid, stage2.id),
+        first = self.client.post(
+            self._starting_squad_url(tid),
             {"selections": selections}, format="json",
         )
-        self.assertEqual(resp.status_code, 400)
-
+        self.assertEqual(first.status_code, 201)
+        second = self.client.post(
+            self._starting_squad_url(tid),
+            {"selections": selections}, format="json",
+        )
+        self.assertEqual(second.status_code, 400)
 
 class StartingSquadAPITests(FantasyTestBase):
     def setUp(self):
@@ -1121,7 +1131,7 @@ class StartingSquadAPITests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.url = reverse(
             "fantasy:team-starting-squad",
-            args=[self.team.id, self.stage.id],
+            args=[self.team.id],
         )
 
     # -- success ----------------------------------------------------------
@@ -1218,26 +1228,28 @@ class StartingSquadAPITests(FantasyTestBase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    def test_round_stage_rejected(self):
-        cup = Competition.objects.create(
-            organization=self.org, name="Cup", slug="cup-p45",
-            type=Competition.Type.CUP,
-        )
-        cup_season = Season.objects.create(
-            competition=cup, name="2026", slug="2026-p45"
-        )
-        round_stage = Stage.objects.create(
-            season=cup_season, kind=Stage.Kind.ROUND, number=1
-        )
+    def test_base_squad_written_to_first_gameweek(self):
+        """
+        Phase 6: the base squad is written to the first GAMEWEEK of the
+        team's season. self.stage is that stage in this test suite.
+        """
         _, selections = self._make_valid_squad()
-        url = reverse(
-            "fantasy:team-starting-squad",
-            args=[self.team.id, round_stage.id],
+        self.client.post(
+            self.url, {"selections": selections}, format="json"
         )
-        resp = self.client.post(
-            url, {"selections": selections}, format="json"
+        base = (
+            Stage.objects.filter(
+                season=self.season, kind=Stage.Kind.GAMEWEEK
+            )
+            .order_by("number")
+            .first()
         )
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            self.team.selections.filter(
+                stage=base, is_free_hit=False
+            ).count(),
+            15,
+        )
 
     def test_locked_gameweek_rejected(self):
         Match.objects.create(
@@ -1255,22 +1267,18 @@ class StartingSquadAPITests(FantasyTestBase):
         self.assertEqual(resp.status_code, 400)
 
     # -- historical integrity --------------------------------------------
-    def test_historical_gameweek_retains_its_squad(self):
+    def test_second_gameweek_carries_forward_from_first(self):
+        """
+        Phase 6: after the base squad is set, a later gameweek resolves to
+        the same squad via carry-forward. This is the phase-6 equivalent of
+        the old "two gameweeks coexist" test.
+        """
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
-        _, gw1_squad = self._make_valid_squad()
+        _, selections = self._make_valid_squad()
         self.client.post(
-            self.url, {"selections": gw1_squad}, format="json"
-        )
-
-        _, gw2_squad = self._make_valid_squad(team=self.away)
-        url2 = reverse(
-            "fantasy:team-starting-squad",
-            args=[self.team.id, stage2.id],
-        )
-        self.client.post(
-            url2, {"selections": gw2_squad}, format="json"
+            self.url, {"selections": selections}, format="json"
         )
 
         gw1_ids = set(
@@ -1278,12 +1286,10 @@ class StartingSquadAPITests(FantasyTestBase):
             .values_list("player_id", flat=True)
         )
         gw2_ids = set(
-            self.team.selections.filter(stage=stage2)
+            get_current_selections(fantasy_team=self.team, stage=stage2)
             .values_list("player_id", flat=True)
         )
-        self.assertEqual(len(gw1_ids), 15)
-        self.assertEqual(len(gw2_ids), 15)
-        self.assertNotEqual(gw1_ids, gw2_ids)
+        self.assertEqual(gw1_ids, gw2_ids)
 
 
 class SquadReadOnlyTests(FantasyTestBase):
@@ -1553,6 +1559,10 @@ class SeasonLeaderboardNoDoubleCountingTests(FantasyTestBase):
     """
     Regression: a player who scored in multiple stages used to have their
     season-aggregated points applied to EVERY stage selection.
+
+    Phase 6 note: the second stage resolves via carry-forward, so a single
+    base squad is all that's needed. This keeps the regression test honest
+    — we're not artificially duplicating selections.
     """
 
     def setUp(self):
@@ -1565,14 +1575,13 @@ class SeasonLeaderboardNoDoubleCountingTests(FantasyTestBase):
             self._player(self.home, pos, f"P{i}")
             for i, pos in enumerate(POSITIONS_15)
         ]
-        for stage in (self.stage, self.stage2):
-            selections = [
-                {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
-                for i, p in enumerate(self.players)
-            ]
-            create_starting_squad(
-                fantasy_team=self.team, stage=stage, selections=selections
-            )
+        selections = [
+            {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
+            for i, p in enumerate(self.players)
+        ]
+        create_starting_squad(
+            fantasy_team=self.team, selections=selections
+        )
 
     def _match_in_stage(self, stage):
         return create_match(
@@ -1724,7 +1733,7 @@ class FantasyEconomyTests(FantasyTestBase):
     def test_squad_within_budget_accepted(self):
         team = self._make_team(name="T")
         _, selections = self._make_valid_squad()
-        create_starting_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        create_starting_squad(fantasy_team=team, selections=selections)
         self.assertEqual(team.selections.filter(stage=self.stage).count(), 15)
 
     def test_squad_over_budget_rejected(self):
@@ -1740,7 +1749,7 @@ class FantasyEconomyTests(FantasyTestBase):
             for i, p in enumerate(players)
         ]
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(fantasy_team=team, stage=self.stage, selections=selections)
+            create_starting_squad(fantasy_team=team, selections=selections)
         self.assertIn("exceeds budget", str(ctx.exception))
         self.assertEqual(team.selections.count(), 0)
 
@@ -1755,7 +1764,7 @@ class FantasyEconomyTests(FantasyTestBase):
             {"player_id": p.id, "is_starter": i < 11, "is_captain": i == 0}
             for i, p in enumerate(players)
         ]
-        create_starting_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        create_starting_squad(fantasy_team=team, selections=selections)
         self.assertEqual(team.selections.filter(stage=self.stage).count(), 15)
 
     def test_player_without_price_rejected(self):
@@ -1765,13 +1774,13 @@ class FantasyEconomyTests(FantasyTestBase):
             player_id=selections[0]["player_id"]
         ).delete()
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(fantasy_team=team, stage=self.stage, selections=selections)
+            create_starting_squad(fantasy_team=team, selections=selections)
         self.assertIn("no fantasy price", str(ctx.exception))
 
     def test_squad_total_cost_helper(self):
         team = self._make_team(name="T")
         _, selections = self._make_valid_squad()
-        create_starting_squad(fantasy_team=team, stage=self.stage, selections=selections)
+        create_starting_squad(fantasy_team=team, selections=selections)
         rows = list(team.selections.filter(stage=self.stage))
         total = squad_total_cost(rows)
         self.assertEqual(total, Decimal("75.0"))
@@ -1781,18 +1790,29 @@ class FantasyEconomyTests(FantasyTestBase):
 # Phase 2 — Gameweek scope
 # ---------------------------------------------------------------------------
 class GameweekScopeTests(FantasyTestBase):
+    """
+    Stage validation for squad operations.
+
+    After Phase 6, `create_starting_squad` no longer takes a stage. Stage
+    validation now lives on the transfer path, so these tests exercise
+    `make_transfer` to verify the same rules.
+    """
+
     def setUp(self):
         super().setUp()
         self.team = self._make_team(name="T")
-        _, self.valid = self._make_valid_squad()
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
+
+    def _outsider(self, position="MID", name="NewM", price=Decimal("5.0")):
+        return self._player(self.away, position, name, price=price)
 
     def test_gameweek_stage_accepted(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
         self.assertEqual(
             self.team.selections.filter(stage=self.stage).count(), 15
         )
 
-    def test_round_stage_rejected(self):
+    def test_transfer_round_stage_rejected(self):
         cup = Competition.objects.create(
             organization=self.org, name="Cup", slug="cup-p2",
             type=Competition.Type.CUP,
@@ -1803,37 +1823,52 @@ class GameweekScopeTests(FantasyTestBase):
         round_stage = Stage.objects.create(
             season=cup_season, kind=Stage.Kind.ROUND, number=1
         )
+        outsider = self._outsider()
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(
-                fantasy_team=self.team, stage=round_stage, selections=self.valid
+            make_transfer(
+                fantasy_team=self.team,
+                stage=round_stage,
+                player_out=self.players[11],
+                player_in=outsider,
             )
         self.assertIn("GAMEWEEK", str(ctx.exception))
 
-    def test_stage_from_same_season_accepted(self):
+    def test_transfer_from_same_season_accepted(self):
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
-        create_starting_squad(fantasy_team=self.team, stage=stage2, selections=self.valid)
+        outsider = self._outsider()
+        make_transfer(
+            fantasy_team=self.team,
+            stage=stage2,
+            player_out=self.players[11],
+            player_in=outsider,
+        )
         self.assertEqual(
-            self.team.selections.filter(stage=stage2).count(), 15
+            self.team.selections.filter(
+                stage=stage2, is_free_hit=False
+            ).count(),
+            15,
         )
 
-    def test_stage_from_different_season_rejected(self):
+    def test_transfer_stage_from_different_season_rejected(self):
         other_season = Season.objects.create(
             competition=self.competition, name="2027", slug="2027-p2"
         )
         other_stage = Stage.objects.create(
             season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
         )
+        outsider = self._outsider()
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(
+            make_transfer(
                 fantasy_team=self.team,
                 stage=other_stage,
-                selections=self.valid,
+                player_out=self.players[11],
+                player_in=outsider,
             )
         self.assertIn("season", str(ctx.exception).lower())
 
-    def test_stage_from_different_competition_rejected(self):
+    def test_transfer_stage_from_different_competition_rejected(self):
         other_comp = Competition.objects.create(
             organization=self.org, name="L2", slug="l2-p2",
             type=Competition.Type.LEAGUE,
@@ -1844,16 +1879,17 @@ class GameweekScopeTests(FantasyTestBase):
         other_stage = Stage.objects.create(
             season=other_season, kind=Stage.Kind.GAMEWEEK, number=1
         )
+        outsider = self._outsider()
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(
+            make_transfer(
                 fantasy_team=self.team,
                 stage=other_stage,
-                selections=self.valid,
+                player_out=self.players[11],
+                player_in=outsider,
             )
         self.assertIn("season", str(ctx.exception).lower())
 
-    def test_rejected_stage_leaves_existing_squad_unchanged(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+    def test_rejected_transfer_leaves_existing_squad_unchanged(self):
         before = set(
             self.team.selections.filter(stage=self.stage)
             .values_list("player_id", flat=True)
@@ -1869,11 +1905,13 @@ class GameweekScopeTests(FantasyTestBase):
         round_stage = Stage.objects.create(
             season=cup_season, kind=Stage.Kind.ROUND, number=1
         )
+        outsider = self._outsider()
         with self.assertRaises(FantasyError):
-            create_starting_squad(
+            make_transfer(
                 fantasy_team=self.team,
                 stage=round_stage,
-                selections=self.valid,
+                player_out=self.players[11],
+                player_in=outsider,
             )
 
         after = set(
@@ -1894,21 +1932,25 @@ class GameweekHistoricalTests(FantasyTestBase):
         self.stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
 
     def test_two_gameweeks_coexist(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
-        new_player = self._player(self.home, "ATT", "NewATT", price=Decimal("5.0"))
-        swapped = [dict(s) for s in self.valid]
-        swapped[-1]["player_id"] = new_player.id
-        create_starting_squad(fantasy_team=self.team, stage=self.stage2, selections=swapped)
+        new_player = self._player(self.away, "ATT", "NewATT", price=Decimal("5.0"))
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage2,
+            player_out=self.players[14],   # bench ATT
+            player_in=new_player,
+        )
 
         gw1 = set(
             self.team.selections.filter(stage=self.stage)
             .values_list("player_id", flat=True)
         )
         gw2 = set(
-            self.team.selections.filter(stage=self.stage2)
-            .values_list("player_id", flat=True)
+            self.team.selections.filter(
+                stage=self.stage2, is_free_hit=False
+            ).values_list("player_id", flat=True)
         )
         self.assertEqual(len(gw1), 15)
         self.assertEqual(len(gw2), 15)
@@ -1916,16 +1958,18 @@ class GameweekHistoricalTests(FantasyTestBase):
         self.assertIn(new_player.id, gw2)
         self.assertNotIn(new_player.id, gw1)
 
-    def test_gw1_unchanged_after_gw2_submission(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+    def test_gw1_unchanged_after_gw2_transfer(self):
         gw1_before = set(
             self.team.selections.filter(stage=self.stage)
             .values_list("player_id", flat=True)
         )
 
-        _, other_squad = self._make_valid_squad(team=self.away)
-        create_starting_squad(
-            fantasy_team=self.team, stage=self.stage2, selections=other_squad
+        new_player = self._player(self.away, "ATT", "NewATT", price=Decimal("5.0"))
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage2,
+            player_out=self.players[14],
+            player_in=new_player,
         )
 
         gw1_after = set(
@@ -1934,7 +1978,6 @@ class GameweekHistoricalTests(FantasyTestBase):
         )
         self.assertEqual(gw1_before, gw1_after)
 
-
 # ---------------------------------------------------------------------------
 # Phase 2 — Gameweek locking
 # ---------------------------------------------------------------------------
@@ -1942,7 +1985,11 @@ class GameweekLockingTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
         self.team = self._make_team(name="T")
-        _, self.valid = self._make_valid_squad()
+        self.players, self.valid = self._make_valid_squad()
+        create_starting_squad(fantasy_team=self.team, selections=self.valid)
+
+    def _outsider(self, position="MID", name="NewM", price=Decimal("5.0")):
+        return self._player(self.away, position, name, price=price)
 
     def _start_match_in_stage(self, stage, *, status=Match.Status.LIVE,
                               minutes_ago=60):
@@ -1956,16 +2003,27 @@ class GameweekLockingTests(FantasyTestBase):
         )
 
     def test_open_gameweek_can_be_edited(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        # No locking conditions — a transfer on the base stage is fine.
+        outsider = self._outsider()
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=outsider,
+        )
         self.assertEqual(
             self.team.selections.filter(stage=self.stage).count(), 15
         )
 
-    def test_locked_gameweek_rejected_on_create(self):
+    def test_locked_gameweek_rejects_transfer(self):
         self._start_match_in_stage(self.stage)
+        outsider = self._outsider()
         with self.assertRaises(FantasyError) as ctx:
-            create_starting_squad(
-                fantasy_team=self.team, stage=self.stage, selections=self.valid
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=outsider,
             )
         self.assertIn("locked", str(ctx.exception).lower())
 
@@ -1978,15 +2036,19 @@ class GameweekLockingTests(FantasyTestBase):
             kickoff_at=None,
             status=Match.Status.FINISHED,
         )
+        outsider = self._outsider()
         with self.assertRaises(FantasyError):
-            create_starting_squad(
-                fantasy_team=self.team, stage=self.stage, selections=self.valid
+            make_transfer(
+                fantasy_team=self.team,
+                stage=self.stage,
+                player_out=self.players[11],
+                player_in=outsider,
             )
 
     def test_locked_gameweek_is_still_readable(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
         self._start_match_in_stage(self.stage)
 
+        # The base squad is still present, and the locked helper reports True.
         self.assertEqual(
             self.team.selections.filter(stage=self.stage).count(), 15
         )
@@ -2001,13 +2063,18 @@ class GameweekLockingTests(FantasyTestBase):
             kickoff_at=timezone.now() - timedelta(hours=2),
             status=Match.Status.POSTPONED,
         )
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+        outsider = self._outsider()
+        make_transfer(
+            fantasy_team=self.team,
+            stage=self.stage,
+            player_out=self.players[11],
+            player_in=outsider,
+        )
         self.assertEqual(
             self.team.selections.filter(stage=self.stage).count(), 15
         )
 
-    def test_locked_submission_leaves_existing_squad_unchanged(self):
-        create_starting_squad(fantasy_team=self.team, stage=self.stage, selections=self.valid)
+    def test_locked_transfer_leaves_existing_squad_unchanged(self):
         before = set(
             self.team.selections.filter(stage=self.stage)
             .values_list("player_id", flat=True)
@@ -2015,12 +2082,13 @@ class GameweekLockingTests(FantasyTestBase):
 
         self._start_match_in_stage(self.stage)
 
-        _, other_squad = self._make_valid_squad(team=self.away)
+        outsider = self._outsider()
         with self.assertRaises(FantasyError):
-            create_starting_squad(
+            make_transfer(
                 fantasy_team=self.team,
                 stage=self.stage,
-                selections=other_squad,
+                player_out=self.players[11],
+                player_in=outsider,
             )
 
         after = set(
@@ -2049,7 +2117,7 @@ class TransferServiceTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def _outsider(self, position, name, price=Decimal("5.0")):
@@ -2115,14 +2183,22 @@ class TransferServiceTests(FantasyTestBase):
         )
 
     def test_transfer_requires_existing_starting_squad(self):
-        stage2 = Stage.objects.create(
-            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        """
+        Phase 6: a transfer without a base squad must be rejected. The team
+        in this test has a base squad, so we build a second team that
+        doesn't, and attempt a transfer on it.
+        """
+        other_user = User.objects.create_user(
+            email="nosquad@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
         )
+        other_team = self._make_team(user=other_user, name="NoSquad")
         new_mid = self._outsider("MID", "X")
         with self.assertRaises(FantasyError) as ctx:
             make_transfer(
-                fantasy_team=self.team,
-                stage=stage2,
+                fantasy_team=other_team,
+                stage=self.stage,
                 player_out=self.players[11],
                 player_in=new_mid,
             )
@@ -2309,28 +2385,37 @@ class TransferServiceTests(FantasyTestBase):
         self.assertIn("limit", str(ctx.exception).lower())
 
     def test_limit_scoped_per_gameweek(self):
+        """
+        Phase 6: each gameweek has its own transfer allowance. The second
+        gameweek carries forward from the base squad, so a transfer there
+        materializes the squad on the fly.
+        """
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
-        )
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=self.valid
         )
         m1 = self._outsider("MID", "M1")
         m2 = self._outsider("MID", "M2")
 
+        # Use up the base gameweek's allowance.
         make_transfer(
             fantasy_team=self.team,
             stage=self.stage,
             player_out=self.players[11],
             player_in=m1,
         )
-        self.assertEqual(transfers_remaining(fantasy_team=self.team, stage=self.stage), 0)
-        self.assertEqual(transfers_remaining(fantasy_team=self.team, stage=stage2), 1)
+        self.assertEqual(
+            transfers_remaining(fantasy_team=self.team, stage=self.stage), 0
+        )
+        self.assertEqual(
+            transfers_remaining(fantasy_team=self.team, stage=stage2), 1
+        )
 
+        # stage2 carries forward from stage1 (which has m1 in place of
+        # players[11]). Use the carried-forward squad as the source.
         make_transfer(
             fantasy_team=self.team,
             stage=stage2,
-            player_out=self.players[11],
+            player_out=m1,
             player_in=m2,
         )
 
@@ -2338,9 +2423,6 @@ class TransferServiceTests(FantasyTestBase):
     def test_historical_gameweek_unchanged(self):
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
-        )
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=self.valid
         )
         gw1_before = set(
             self.team.selections.filter(stage=self.stage)
@@ -2395,7 +2477,6 @@ class TransferServiceTests(FantasyTestBase):
         self.assertEqual(before_ids, after_ids)
         self.assertEqual(FantasyTransfer.objects.count(), before_transfers)
 
-
 class TransferAPITests(FantasyTestBase):
     def setUp(self):
         super().setUp()
@@ -2404,7 +2485,7 @@ class TransferAPITests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         self.url = reverse("fantasy:team-transfers", args=[self.team.id])
 
@@ -2545,7 +2626,7 @@ class GameweekPointsServiceTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def _match(self, stage, home=None, away=None):
@@ -2633,31 +2714,37 @@ class GameweekPointsServiceTests(FantasyTestBase):
         self.assertEqual(data["total_points"], 6)
 
     def test_historical_gameweek_uses_its_own_squad(self):
+        """
+        Phase 6: a distinct stage2 squad is produced by a transfer that
+        materializes the carried-forward squad, then swaps one bench MID.
+        """
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
         new_mid = self._player(self.away, "MID", "NewMID")
-        gw2_payload = [
-            {"player_id": new_mid.id if s["player_id"] == self.players[11].id else s["player_id"],
-             "is_starter": s["is_starter"],
-             "is_captain": s["is_captain"]}
-            for s in self.valid
-        ]
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=gw2_payload
+        make_transfer(
+            fantasy_team=self.team,
+            stage=stage2,
+            player_out=self.players[11],   # bench MID
+            player_in=new_mid,
         )
 
         m1 = self._match(self.stage)
         m2 = self._match(stage2)
-        self._points(m1, self.players[11], 9)   # in GW1 squad
+        self._points(m1, self.players[11], 9)   # in GW1 squad only
         self._points(m2, self.players[11], 20)  # not in GW2 squad
         self._points(m2, new_mid, 4)            # in GW2 squad
 
         gw1 = get_gameweek_points(fantasy_team=self.team, stage=self.stage)
         gw2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
 
+        # players[11] is bench in GW1 → contributes to bench_points only.
         self.assertEqual(gw1["bench_points"], 9)
         self.assertEqual(gw1["total_points"], 0)
+
+        # new_mid takes players[11]'s bench slot in GW2 → contributes
+        # to GW2's bench_points. players[11]'s points from stage2 don't
+        # count because they're not in the GW2 squad.
         self.assertEqual(gw2["bench_points"], 4)
         self.assertEqual(gw2["total_points"], 0)
 
@@ -2699,16 +2786,26 @@ class GameweekPointsServiceTests(FantasyTestBase):
         with self.assertRaises(FantasyError):
             get_gameweek_points(fantasy_team=self.team, stage=other_stage)
 
-    def test_no_squad_for_stage_returns_empty(self):
-        stage_empty = Stage.objects.create(
-            season=self.season, kind=Stage.Kind.GAMEWEEK, number=3
+    def test_no_squad_for_team_returns_empty(self):
+        """
+        Phase 6: carry-forward means a gameweek with no explicit rows
+        resolves to the base squad. The 'empty squad' scenario only
+        applies to a team that has never created a base squad.
+
+        Build a fresh team with no base squad and confirm the response
+        has no players.
+        """
+        other_user = User.objects.create_user(
+            email="nosquad-p4@example.com",
+            password="StrongPass!23",
+            role=User.Role.USER,
         )
+        other_team = self._make_team(user=other_user, name="NoSquad")
         data = get_gameweek_points(
-            fantasy_team=self.team, stage=stage_empty
+            fantasy_team=other_team, stage=self.stage
         )
         self.assertEqual(data["total_points"], 0)
         self.assertEqual(data["players"], [])
-
 
 class GameweekPointsAPITests(FantasyTestBase):
     def setUp(self):
@@ -2718,7 +2815,7 @@ class GameweekPointsAPITests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def _url(self):
@@ -2816,7 +2913,7 @@ class ChipActivationTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         self.url = reverse("fantasy:team-chips", args=[self.team.id])
 
@@ -2974,14 +3071,13 @@ class ChipActivationTests(FantasyTestBase):
         )
         self.assertEqual(resp.status_code, 400)
 
-
 class WildcardTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def _outsider(self, position, name, price=Decimal("5.0")):
@@ -3043,7 +3139,6 @@ class WildcardTests(FantasyTestBase):
         self.assertEqual(
             transfers_used(fantasy_team=self.team, stage=self.stage), 0
         )
-        # History preserved.
         self.assertEqual(
             FantasyTransfer.objects.filter(
                 fantasy_team=self.team, stage=self.stage
@@ -3082,7 +3177,7 @@ class BenchBoostTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         m = Match.objects.create(
             competition=self.competition,
@@ -3113,13 +3208,10 @@ class BenchBoostTests(FantasyTestBase):
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=self.valid
-        )
+        # No explicit rows for stage2 — it resolves via carry-forward.
         data2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
         self.assertIsNone(data2["active_chip"])
         self.assertEqual(data2["total_points"], 0)
-
 
 class TripleCaptainTests(FantasyTestBase):
     def setUp(self):
@@ -3127,7 +3219,7 @@ class TripleCaptainTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         m = Match.objects.create(
             competition=self.competition,
@@ -3159,18 +3251,19 @@ class TripleCaptainTests(FantasyTestBase):
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
         )
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=self.valid
-        )
+        # Give the captain points in stage2.
         m2 = Match.objects.create(
             competition=self.competition,
             home_team=self.home, away_team=self.away, stage=stage2,
         )
         FantasyPoints.objects.create(match=m2, player=self.players[0], points=8)
+
+        # stage2 has no chip active. Its squad resolves via carry-forward,
+        # so the captain is players[0] with the default multiplier.
         data2 = get_gameweek_points(fantasy_team=self.team, stage=stage2)
         cap2 = next(p for p in data2["players"] if p["is_captain"])
         self.assertEqual(cap2["multiplier"], 2)
-
+        self.assertIsNone(data2["active_chip"])
 
 class ChipTransferAccountingTests(FantasyTestBase):
     def setUp(self):
@@ -3178,7 +3271,7 @@ class ChipTransferAccountingTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def _outsider(self, position, name):
@@ -3204,12 +3297,10 @@ class ChipTransferAccountingTests(FantasyTestBase):
             fantasy_team=self.team, stage=self.stage,
             player_out=self.players[11], player_in=a,
         )
-        # Wildcard + 2 transfers in stage 2.
+        # Wildcard in stage 2. Stage 2 carries forward from stage 1
+        # (which now has `a` in place of players[11]).
         stage2 = Stage.objects.create(
             season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
-        )
-        create_starting_squad(
-            fantasy_team=self.team, stage=stage2, selections=self.valid
         )
         activate_chip(
             fantasy_team=self.team, stage=stage2, chip_type="WILDCARD"
@@ -3218,7 +3309,7 @@ class ChipTransferAccountingTests(FantasyTestBase):
         c = self._outsider("MID", "C")
         make_transfer(
             fantasy_team=self.team, stage=stage2,
-            player_out=self.players[11], player_in=b,
+            player_out=a, player_in=b,
         )
         make_transfer(
             fantasy_team=self.team, stage=stage2,
@@ -3231,7 +3322,6 @@ class ChipTransferAccountingTests(FantasyTestBase):
             transfers_used(fantasy_team=self.team, stage=stage2), 0
         )
 
-
 class ChipSquadResponseTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
@@ -3240,7 +3330,7 @@ class ChipSquadResponseTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
 
     def test_squad_response_shows_active_chip(self):
@@ -3267,6 +3357,8 @@ class ChipSquadResponseTests(FantasyTestBase):
         # Starters should be from the FH squad.
         fh_ids = {s["player_id"] for s in fh_sel if s["is_starter"]}
         self.assertEqual(returned_ids, fh_ids)
+
+
 class StageFinishedDerivationTests(FantasyTestBase):
     """
     Verifies that a gameweek is only considered finished when ALL relevant
@@ -3283,7 +3375,7 @@ class StageFinishedDerivationTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         self.fh_players, self.fh_selections = self._make_valid_squad(team=self.away)
 
@@ -3391,14 +3483,13 @@ class StageFinishedDerivationTests(FantasyTestBase):
         )
         self.assertEqual(scoring_ids, self._fh_ids())
 
-
 class FreeHitLifecycleTests(FantasyTestBase):
     def setUp(self):
         super().setUp()
         self.team = self._make_team(name="T")
         self.players, self.valid = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=self.valid
+            fantasy_team=self.team, selections=self.valid
         )
         self.fh_players, self.fh_selections = self._make_valid_squad(team=self.away)
 
@@ -3409,11 +3500,6 @@ class FreeHitLifecycleTests(FantasyTestBase):
         )
 
     def _finish_gameweek(self):
-        """
-        Mark every existing match in the stage as FINISHED. The base fixture
-        already creates one match on self.stage, so this transitions it to
-        FINISHED rather than adding a new one.
-        """
         Match.objects.filter(stage=self.stage).update(
             status=Match.Status.FINISHED
         )
@@ -3472,7 +3558,6 @@ class FreeHitLifecycleTests(FantasyTestBase):
 
     def test_historical_points_use_fh_squad(self):
         self._activate_fh()
-        # `_finish_gameweek` marks the existing stage match FINISHED.
         self._finish_gameweek()
         m = Match.objects.filter(stage=self.stage).first()
 
@@ -3675,3 +3760,314 @@ class SeedDemoCommandTests(TestCase):
             ).count(),
             1,
         )
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Squad carry-forward
+# ---------------------------------------------------------------------------
+class SquadCarryForwardTests(FantasyTestBase):
+    """
+    Base squad is created once. Every later gameweek resolves to the same
+    squad unless the user makes a transfer in that gameweek.
+
+    These tests validate the carry-forward contract. If any fail, a service
+    update is missing (see the notes on each test for what to check).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.team = self._make_team(name="T")
+        self.players, self.valid = self._make_valid_squad()
+
+    # ------------------------------------------------------------------
+    # Base squad creation
+    # ------------------------------------------------------------------
+    def test_starting_squad_has_no_stage_argument(self):
+        """
+        CHECK: fantasy/services/teams.py — create_starting_squad() must not
+        require a `stage` kwarg. It writes to the base stage (first
+        GAMEWEEK of the season).
+        """
+        # Should succeed with just fantasy_team + selections.
+        create_starting_squad(
+            fantasy_team=self.team,
+            selections=self.valid,
+        )
+        base = (
+            Stage.objects.filter(
+                season=self.season, kind=Stage.Kind.GAMEWEEK
+            )
+            .order_by("number")
+            .first()
+        )
+        self.assertEqual(
+            self.team.selections.filter(
+                stage=base, is_free_hit=False
+            ).count(),
+            15,
+        )
+
+    def test_second_starting_squad_rejected(self):
+        """
+        CHECK: create_starting_squad() must reject a second call for the
+        same fantasy team, regardless of stage.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        with self.assertRaises(FantasyError):
+            create_starting_squad(
+                fantasy_team=self.team, selections=self.valid
+            )
+
+    # ------------------------------------------------------------------
+    # Carry-forward resolution
+    # ------------------------------------------------------------------
+    def test_get_current_selections_carries_forward(self):
+        """
+        CHECK: fantasy/services/chips.py — get_current_selections() must
+        walk backwards through earlier GAMEWEEK stages when the requested
+        stage has no rows.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        ids = set(
+            get_current_selections(fantasy_team=self.team, stage=gw2)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.players})
+
+    def test_get_current_selections_carries_forward_multiple_gameweeks(self):
+        """
+        Carry-forward should walk arbitrarily far back, not just one stage.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        gw3 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=3
+        )
+        # Request GW3 directly — no rows in GW2 or GW3.
+        ids = set(
+            get_current_selections(fantasy_team=self.team, stage=gw3)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.players})
+
+    def test_get_scoring_selections_carries_forward(self):
+        """
+        CHECK: get_scoring_selections() must use the same carry-forward
+        resolution so that historical points and current squad agree until
+        a transfer changes one of them.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        ids = set(
+            get_scoring_selections(fantasy_team=self.team, stage=gw2)
+            .values_list("player_id", flat=True)
+        )
+        self.assertEqual(ids, {p.id for p in self.players})
+
+    # ------------------------------------------------------------------
+    # Materialization on transfer
+    # ------------------------------------------------------------------
+    def test_transfer_on_empty_stage_materializes_rows(self):
+        """
+        CHECK: fantasy/services/transfers.py — make_transfer() must
+        auto-copy the carried-forward squad into the current stage before
+        applying the swap.
+
+        After the transfer:
+          - the stage has its own 15 rows,
+          - the incoming player is there,
+          - the outgoing player is gone,
+          - earlier stages are unchanged.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        # Sanity: gw2 has no rows yet.
+        self.assertEqual(
+            self.team.selections.filter(stage=gw2).count(), 0
+        )
+
+        outsider = self._player(self.away, "ATT", "NewATT")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=gw2,
+            player_out=self.players[14],  # bench ATT
+            player_in=outsider,
+        )
+
+        # gw2 now has explicit rows.
+        self.assertEqual(
+            self.team.selections.filter(
+                stage=gw2, is_free_hit=False
+            ).count(),
+            15,
+        )
+        gw2_ids = set(
+            self.team.selections.filter(stage=gw2, is_free_hit=False)
+            .values_list("player_id", flat=True)
+        )
+        self.assertIn(outsider.id, gw2_ids)
+        self.assertNotIn(self.players[14].id, gw2_ids)
+
+    def test_transfer_does_not_mutate_earlier_stages(self):
+        """
+        Making a transfer in GW2 must not touch GW1's stored rows.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw1 = (
+            Stage.objects.filter(
+                season=self.season, kind=Stage.Kind.GAMEWEEK
+            )
+            .order_by("number")
+            .first()
+        )
+        gw1_before = set(
+            self.team.selections.filter(
+                stage=gw1, is_free_hit=False
+            ).values_list("player_id", flat=True)
+        )
+
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        outsider = self._player(self.away, "ATT", "NewATT")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=gw2,
+            player_out=self.players[14],
+            player_in=outsider,
+        )
+
+        gw1_after = set(
+            self.team.selections.filter(
+                stage=gw1, is_free_hit=False
+            ).values_list("player_id", flat=True)
+        )
+        self.assertEqual(gw1_before, gw1_after)
+
+    def test_carry_forward_preserves_captain_and_slots(self):
+        """
+        Carry-forward must reproduce starter/bench/captain exactly, not
+        just the player set.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        carried = list(
+            get_current_selections(fantasy_team=self.team, stage=gw2)
+            .order_by("player_id")
+        )
+        original = list(
+            self.team.selections.filter(
+                stage=gw2, is_free_hit=False
+            ).order_by("player_id")
+        )
+        # gw2 has no rows — carried is derived from gw1.
+        # Compare against gw1 rows instead.
+        base = (
+            Stage.objects.filter(
+                season=self.season, kind=Stage.Kind.GAMEWEEK
+            )
+            .order_by("number")
+            .first()
+        )
+        gw1_rows = list(
+            self.team.selections.filter(
+                stage=base, is_free_hit=False
+            ).order_by("player_id")
+        )
+        by_player_carried = {s.player_id: s for s in carried}
+        for orig in gw1_rows:
+            c = by_player_carried[orig.player_id]
+            self.assertEqual(c.is_starter, orig.is_starter)
+            self.assertEqual(c.is_captain, orig.is_captain)
+
+    # ------------------------------------------------------------------
+    # Interaction with transfers on later gameweeks
+    # ------------------------------------------------------------------
+    def test_later_transfer_uses_latest_materialized_squad(self):
+        """
+        If GW2 was materialized (via a transfer), then GW3 carries forward
+        from GW2's rows, not from GW1's base.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        outsider = self._player(self.away, "ATT", "GW2Att")
+        make_transfer(
+            fantasy_team=self.team,
+            stage=gw2,
+            player_out=self.players[14],
+            player_in=outsider,
+        )
+
+        gw3 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=3
+        )
+        gw3_ids = set(
+            get_current_selections(fantasy_team=self.team, stage=gw3)
+            .values_list("player_id", flat=True)
+        )
+        # GW3 should inherit GW2's swap.
+        self.assertIn(outsider.id, gw3_ids)
+        self.assertNotIn(self.players[14].id, gw3_ids)
+
+    # ------------------------------------------------------------------
+    # Interaction with Free Hit
+    # ------------------------------------------------------------------
+    def test_free_hit_does_not_break_carry_forward(self):
+        """
+        After a Free Hit gameweek, the next gameweek resolves to the
+        permanent squad — not the Free Hit squad.
+        """
+        create_starting_squad(
+            fantasy_team=self.team, selections=self.valid
+        )
+        gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2
+        )
+        # FH requires the permanent squad to exist for the stage — so
+        # materialize first via a transfer. Or if your Free Hit
+        # precondition was updated (see Phase 6 notes), FH can go directly.
+        _, fh_squad = self._make_valid_squad(team=self.away)
+        from fantasy.services import activate_chip
+        activate_chip(
+            fantasy_team=self.team, stage=gw2,
+            chip_type="FREE_HIT", selections=fh_squad,
+        )
+
+        gw3 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=3
+        )
+        gw3_ids = set(
+            get_current_selections(fantasy_team=self.team, stage=gw3)
+            .values_list("player_id", flat=True)
+        )
+        # GW3 should NOT contain the away players from the Free Hit.
+        away_ids = {p.id for p in self.players}
+        self.assertEqual(gw3_ids, away_ids)
