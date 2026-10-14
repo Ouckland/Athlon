@@ -909,26 +909,22 @@ class GroupManagementTests(FantasyTestBase):
             remove_group_member(owner=self.user, group=group, member_user=self.user)
 
     def test_group_stage_leaderboard_scoped_to_members(self):
-        # Owner team gets a starting squad.
         owner_team = self._make_team(name="Owner")
         players, selections = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=owner_team, stage=self.stage, selections=selections
+            fantasy_team=owner_team, selections=selections
         )
 
         # Outsider with their own team, NOT in group. Their starting squad
         # must exist BEFORE the stage locks.
-        outsider = User.objects.create_user(
-            email="outsider@example.com", password="StrongPass!23"
-        )
+        outsider = User.objects.create_user(email="outsider@example.com", password="StrongPass!23")
         outsider_team = self._make_team(user=outsider, name="Outsider")
         _, selections2 = self._make_valid_squad(team=self.away)
         create_starting_squad(
-            fantasy_team=outsider_team, stage=self.stage, selections=selections2
+            fantasy_team=outsider_team, selections=selections2
         )
 
-        # Now lock the stage by moving its match to LIVE, then add the
-        # owner's lineup + goal and recalculate points.
+        # Now lock the stage by moving its match to LIVE.
         for p in players[:11]:
             MatchLineup.objects.create(
                 match=self.match, team=self.home, player=p,
@@ -1304,7 +1300,7 @@ class SquadReadOnlyTests(FantasyTestBase):
         self.team = self._make_team(name="T")
         _, selections = self._make_valid_squad()
         create_starting_squad(
-            fantasy_team=self.team, stage=self.stage, selections=selections
+            fantasy_team=self.team, selections=selections
         )
         self.url = reverse(
             "fantasy:team-squad", args=[self.team.id, self.stage.id]
@@ -1477,7 +1473,7 @@ class FantasyLeaderboardAPITests(FantasyAPITestBase):
         tid = resp.data["id"]
         _, selections = self._make_valid_squad()
         self.client.post(
-            reverse("fantasy:team-starting-squad", args=[tid, self.stage.id]),
+            reverse("fantasy:team-starting-squad", args=[tid]),
             {"selections": selections}, format="json",
         )
         resp = self.client.get(
@@ -1544,7 +1540,7 @@ class FantasyPointsReadOnlyTests(FantasyAPITestBase):
         _, selections = self._make_valid_squad()
         payload = {"selections": selections, "points": 999}
         resp = self.client.post(
-            reverse("fantasy:team-starting-squad", args=[tid, self.stage.id]),
+            reverse("fantasy:team-starting-squad", args=[tid]),
             payload,
             format="json",
         )

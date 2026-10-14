@@ -234,7 +234,7 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------
     # Seed
     # ------------------------------------------------------------------
-    def _seed(self):
+        def _seed(self):
         # -- 1. Organization, competition, season ------------------------
         org = create_organization(
             name="FUNAAB Sports",
@@ -261,9 +261,6 @@ class Command(BaseCommand):
         gw4 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=4, name="Gameweek 4")
         gw5 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=5, name="Gameweek 5")
 
-        # -- 13. Cup with a group stage + knockout -----------------------
-        self._create_demo_cup(org=org, teams=teams, players_by_team_id=players_by_team_id)
-        
         # -- 3. Teams + participation ------------------------------------
         teams = []
         for name, short in TEAM_SPECS:
@@ -310,9 +307,13 @@ class Command(BaseCommand):
             )
             fantasy_teams.append(ft)
 
-        # -- 8. GW1: completed, with chips -------------------------------
+        # -- 8. Base squads ----------------------------------------------
+        # Phase 6: one base squad per fantasy team, written to GW1.
+        # Later gameweeks resolve via carry-forward.
+        self._create_squads_for_all(fantasy_teams, players_by_team_id)
+
+        # -- 9. GW1: completed, with chips -------------------------------
         gw1_matches = self._create_matches(gw1, competition, teams)
-        self._create_squads_for_all(fantasy_teams, gw1, players_by_team_id)
         activate_chip(fantasy_team=fantasy_teams[3], stage=gw1, chip_type="BENCH_BOOST")
         activate_chip(fantasy_team=fantasy_teams[4], stage=gw1, chip_type="TRIPLE_CAPTAIN")
         self._play_out_stage(
@@ -322,9 +323,8 @@ class Command(BaseCommand):
             away_goals=[0, 1, 0],
         )
 
-        # -- 9. GW2: completed, no chips ---------------------------------
+        # -- 10. GW2: completed, no chips --------------------------------
         gw2_matches = self._create_matches(gw2, competition, teams)
-        self._create_squads_for_all(fantasy_teams, gw2, players_by_team_id)
         self._play_out_stage(
             gw2_matches, players_by_team_id,
             offset_days=-7,
@@ -332,9 +332,8 @@ class Command(BaseCommand):
             away_goals=[1, 1, 0],
         )
 
-        # -- 10. GW3: mixed LIVE / HALFTIME / SCHEDULED, with Free Hit ---
+        # -- 11. GW3: mixed LIVE / HALFTIME / SCHEDULED, with Free Hit ---
         gw3_matches = self._create_matches(gw3, competition, teams)
-        self._create_squads_for_all(fantasy_teams, gw3, players_by_team_id)
         # Free Hit for user3 (fantasy_teams[2]) using a different team's squad
         fh_squad = self._build_squad_payload(
             list(players_by_team_id[teams[3].id])
@@ -345,9 +344,8 @@ class Command(BaseCommand):
         )
         self._play_out_mixed_stage(gw3_matches, players_by_team_id)
 
-        # -- 11. GW4: upcoming, with a normal transfer and a Wildcard ----
+        # -- 12. GW4: upcoming, with a normal transfer and a Wildcard ----
         gw4_matches = self._create_matches(gw4, competition, teams)
-        self._create_squads_for_all(fantasy_teams, gw4, players_by_team_id)
         # Normal transfer for user1
         self._make_demo_transfer(
             fantasy_team=fantasy_teams[0], stage=gw4,
@@ -364,9 +362,12 @@ class Command(BaseCommand):
             replacement_players=list(players_by_team_id[teams[2].id]),
         )
 
-        # -- 12. GW5: fixtures spread across the next 7 days -------------
-        #     Lineups pre-submitted so the frontend has realistic data to
-        #     render and managers have something to edit.
+        # -- 13. Cup with a group stage + knockout -----------------------
+        self._create_demo_cup(
+            org=org, teams=teams, players_by_team_id=players_by_team_id
+        )
+
+        # -- 14. GW5: fixtures spread across the next 7 days -------------
         self._create_week_fixtures(
             competition=competition,
             season=season,
