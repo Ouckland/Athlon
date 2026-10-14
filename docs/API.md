@@ -1,6 +1,6 @@
 # Athlon — API Contract
 
-**Version:** MVP backend (post-Phase 5)
+**Version:** MVP backend (post Phase 6)
 **Audience:** React/PWA frontend developers
 **Base URL (dev):** `http://localhost:8000`
 
@@ -24,7 +24,7 @@ Competition        (type: LEAGUE | CUP)
     ↓
 Season
     ↓
-Stage              (kind: GAMEWEEK | ROUND)
+Stage              (kind: GAMEWEEK | ROUND, is_group flag for cup groups)
     ↓
 Match              (home_team, away_team, status, scores, minute)
     ↓
@@ -32,7 +32,7 @@ MatchEvent         (GOAL, YELLOW, RED, SUBSTITUTION, HALFTIME, FULLTIME)
     ↓
 FantasyPoints      (server-derived from events + lineups)
     ↓
-Leaderboards
+Standings / Leaderboards
 ```
 
 Fantasy axis (parallel to the match axis):
@@ -40,11 +40,14 @@ Fantasy axis (parallel to the match axis):
 ```
 FantasyTeam        (user + competition + season)
     ↓
-FantasyPlayerSelection  (per-stage squad: 15 players, 11 starters, 1 captain)
+Base Squad         (created once; written to the first GAMEWEEK of the season)
     ↓
-FantasyTransfer         (audit log; Wildcard/Free Hit transfers flagged)
+Carry-forward      (every later gameweek resolves to the base squad unless
+                    changed by a transfer)
     ↓
-FantasyChipUse          (one use per chip per season, one chip per gameweek)
+FantasyTransfer    (audit log; Wildcard / Free Hit transfers flagged)
+    ↓
+FantasyChipUse     (one use per chip per season; one chip per gameweek)
 ```
 
 Team management axis:
@@ -58,7 +61,7 @@ Team   ←→   TeamManager   (user may manage multiple teams;
 
 - `/api/accounts/` — registration, login, email verification, password reset
 - `/api/league/` — organizations, competitions, seasons, stages, teams,
-  players, team managers, competition participation
+  players, team managers, competition participation, standings
 - `/api/matches/` — matches, events, lineups
 - `/api/fantasy/` — fantasy teams, squads, transfers, chips, points, groups,
   leaderboards
@@ -202,8 +205,7 @@ Access: Public
 }
 ```
 
-**Response `201`:** User object. Session cookie set (user is logged in
-immediately).
+**Response `201`:** User object. Session cookie set.
 
 **Errors:** `400` — duplicate email, password mismatch, weak password.
 
@@ -224,8 +226,6 @@ Access: Public
 - `400` — missing email or password.
 - `401` — invalid credentials or inactive account.
 
-**Side effects:** Session cookie set.
-
 ### Logout
 
 ```
@@ -235,16 +235,12 @@ Access: Authenticated
 
 **Response `204`.** Session invalidated.
 
-**Errors:** `403` if anonymous.
-
 ### Current user
 
 ```
 GET /api/accounts/me/
 Access: Authenticated
 ```
-
-**Response `200`:** User object.
 
 **User object:**
 
@@ -271,8 +267,6 @@ Access: Public
 
 **Response `200`:** `{ "detail": "Email verified successfully.", "email_verified": true }`
 
-Already-verified returns `200` with `"Email is already verified."`.
-
 **Errors:** `400` — invalid or expired token; body includes `"reason"`.
 
 ### Resend verification
@@ -285,8 +279,6 @@ Access: Public
 **Request:** `{"email": "ada@example.com"}`
 
 **Response `200`:** `{ "detail": "If an account exists for this email and is unverified, a verification email has been sent." }`
-
-Same response whether the email exists or not.
 
 ### Forgot password
 
@@ -339,8 +331,7 @@ team.
 
 - A user may manage multiple teams.
 - A team may have multiple managers.
-- A SCOUT does not become a team manager automatically. Only an explicit
-  `TeamManager` row grants the permission.
+- A SCOUT does not become a team manager automatically.
 
 The reusable check is `can_manage_team(user, team)`:
 
@@ -354,8 +345,8 @@ The reusable check is `can_manage_team(user, team)`:
 | Anonymous | No |
 
 Public/anonymous endpoints: all `GET` reads on league, matches, lineups,
-players, teams, organizations, competitions, seasons, stages, public matches.
-See §12 for the fixtures/livescore feed.
+players, teams, organizations, competitions, seasons, stages, standings,
+public matches. See §12 for the fixtures/livescore feed.
 
 ---
 
@@ -388,7 +379,7 @@ POST /api/league/organizations/           Access: Authenticated (any role)
 { "name": "FUNAAB Sports", "description": "Optional" }
 ```
 
-**POST response `201`:** Organization object. `slug` is generated server-side.
+**POST response `201`:** Organization object. `slug` generated server-side.
 
 **Errors:** `400` — name empty.
 
@@ -398,8 +389,6 @@ POST /api/league/organizations/           Access: Authenticated (any role)
 GET /api/league/organizations/<id>/
 Access: Public
 ```
-
-**Response `200`:** Organization object. `404` if unknown.
 
 **No update or delete endpoint.**
 
@@ -427,8 +416,7 @@ Access: Public
 ```
 
 - `type` — `LEAGUE` (default) or `CUP`.
-- `season` — legacy free-text field. Use the structured Season API (§7) for
-  real season handling.
+- `season` — legacy free-text field. Use the structured Season API (§7).
 
 ### List / create
 
@@ -532,8 +520,6 @@ POST /api/league/competitions/<competition_id>/seasons/   Access: Authenticated
 
 **Errors:** `400` — empty name, invalid status, or `end_date < start_date`.
 
-**Notes:** `slug` generated server-side, unique within the competition.
-
 ### Retrieve season
 
 ```
@@ -550,6 +536,7 @@ Access: Public
   "kind": "GAMEWEEK",
   "number": 1,
   "name": "",
+  "is_group": false,
   "start_date": null,
   "end_date": null,
   "created_at": "2026-09-15T12:00:00Z",
@@ -558,6 +545,9 @@ Access: Public
 ```
 
 - `kind` — `GAMEWEEK` (for `LEAGUE` competitions) or `ROUND` (for `CUP`).
+- `is_group` — only meaningful when `kind == "ROUND"`. `true` marks a cup
+  round as a group stage whose results form a table (§7.5). `false` (default)
+  on knockout rounds.
 
 ### List / create stages
 
@@ -569,8 +559,17 @@ POST /api/league/seasons/<season_id>/stages/   Access: Authenticated
 **POST request:**
 
 ```json
-{ "kind": "GAMEWEEK", "number": 1, "name": "", "start_date": null, "end_date": null }
+{
+  "kind": "ROUND",
+  "number": 1,
+  "name": "Group Stage",
+  "is_group": true,
+  "start_date": null,
+  "end_date": null
+}
 ```
+
+`is_group` is optional and defaults to `false`.
 
 **Errors:** `400` — invalid `kind`, kind mismatches the parent competition's
 type, duplicate `number` in the season, or invalid date range.
@@ -581,6 +580,139 @@ type, duplicate `number` in the season, or invalid date range.
 GET /api/league/stages/<id>/
 Access: Public
 ```
+
+---
+
+## 7.5 Standings
+
+A read-only endpoint that returns a football standings table. It works for
+`LEAGUE` competitions (season table) and for `CUP` group stages. The backend
+aggregates both identically — the only difference is which matches feed in.
+
+### Standings object
+
+```json
+{
+  "competition": { "id": 3, "name": "FUNAAB Football League", "slug": "funaab-football-league" },
+  "season": { "id": 3, "name": "2026 Season", "slug": "2026-season", "status": "ACTIVE" },
+  "stage": null,
+  "scope": "season",
+  "rows": [
+    {
+      "rank": 1,
+      "team": { "id": 13, "name": "Agric United", "short_name": "AGU", "slug": "agric-united" },
+      "played": 5,
+      "won": 3,
+      "drawn": 1,
+      "lost": 1,
+      "goals_for": 8,
+      "goals_against": 5,
+      "goal_difference": 3,
+      "points": 10
+    }
+  ]
+}
+```
+
+Field notes:
+
+- **`scope`** — `"season"` when the table covers the whole season, `"stage"`
+  when scoped to one stage. Frontend uses this to decide the label.
+- **`stage`** — the stage object (including `kind` and `is_group`) when
+  `scope == "stage"`, otherwise `null`.
+- **`season`** — the resolved season. If the request omitted `season`, the
+  backend picks the most recent `ACTIVE` season, else the most recent by
+  `start_date`.
+- **`rows`** — always ordered by the server. Do not re-sort client-side.
+
+### List standings
+
+```
+GET /api/league/competitions/<competition_id>/standings/
+Access: Public
+```
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `season` | int | no | Season ID. Defaults to the competition's most recent `ACTIVE` season, else the most recent by `start_date`. |
+| `stage` | int | no | If present, scope to this stage. If omitted, aggregate every `FINISHED` match in the season. |
+
+**Semantics:**
+
+- Only `FINISHED` matches count.
+- **Points:** 3 for a win, 1 for a draw, 0 for a loss.
+- **Order:** Points (desc) → Goal Difference (desc) → Goals For (desc) →
+  Team name (asc).
+- **`scope="season"`:** every team participating in the competition appears,
+  even with `played: 0`.
+- **`scope="stage"`:** only teams with at least one match in that stage
+  appear. A group stage therefore shows all group members; a knockout round
+  shows only the teams actually drawn into that round.
+
+### When the frontend renders a table
+
+```js
+const showTable =
+  data.scope === "season" ||
+  data.stage?.kind === "GAMEWEEK" ||
+  (data.stage?.kind === "ROUND" && data.stage?.is_group === true);
+```
+
+- `scope="season"` → always show the table.
+- `stage.kind == "GAMEWEEK"` → show the table.
+- `stage.kind == "ROUND"` with `is_group == true` → show the table (cup group).
+- `stage.kind == "ROUND"` with `is_group == false` → **hide the table**. The
+  backend still returns rows, but they don't represent a meaningful table.
+  Render a bracket or fixtures list instead.
+
+### Examples
+
+```
+GET /api/league/competitions/3/standings/
+GET /api/league/competitions/3/standings/?season=3
+GET /api/league/competitions/3/standings/?season=3&stage=11
+GET /api/league/competitions/7/standings/?season=4&stage=21
+```
+
+### Errors
+
+| Condition | Status |
+|---|---|
+| Competition unknown | `404` |
+| `season` non-integer | `400` |
+| `season` unknown or from another competition | `404` |
+| `stage` non-integer | `400` |
+| `stage` unknown or from another competition's season | `404` |
+
+A competition with no seasons returns `200` with `season: null, rows: []`.
+
+### Frontend integration
+
+1. `GET /api/league/competitions/` → populate the competition selector.
+2. `GET /api/league/competitions/<id>/seasons/` → populate the season selector.
+3. `GET /api/league/seasons/<season_id>/stages/` → populate the stage selector.
+4. On any change, call the standings endpoint with the current selection:
+
+```js
+const params = new URLSearchParams();
+if (seasonId) params.set("season", seasonId);
+if (stageId) params.set("stage", stageId);
+
+const res = await fetch(
+  `/api/league/competitions/${competitionId}/standings/?${params}`,
+  { credentials: "include" }
+);
+const data = await res.json();
+
+const showTable =
+  data.scope === "season" ||
+  data.stage?.kind === "GAMEWEEK" ||
+  (data.stage?.kind === "ROUND" && data.stage?.is_group === true);
+```
+
+If `showTable` is `false`, render a non-table layout.
 
 ---
 
@@ -768,8 +900,8 @@ Access: Authenticated (any role)
 }
 ```
 
-**Errors:** `400` — shirt number out of range (1–99) or duplicated within the
-team; invalid position.
+**Errors:** `400` — shirt number out of range (1–99) or duplicated within
+the team; invalid position.
 
 ### Retrieve player
 
@@ -918,9 +1050,8 @@ Access: Public
   `POSTPONED` and `CANCELLED`.
 - `date=tomorrow` — same rules, tomorrow.
 - `date=week` — today through today + 6 days, inclusive (7 calendar days).
-  End boundary exclusive. Same status exclusions.
-- `status=LIVE` — matches with `status` in (`LIVE`, `HALFTIME`), regardless of
-  kickoff date. A live match whose kickoff was yesterday still appears here.
+- `status=LIVE` — matches with `status` in (`LIVE`, `HALFTIME`), regardless
+  of kickoff date.
 - `competition=<id>` — integer; non-integer → `400`, unknown → `404`.
 - `organization=<id>` — same validation.
 
@@ -935,20 +1066,9 @@ Access: Public
 
 **Ordering:** `kickoff_at` ascending (nulls last), then `id` ascending.
 
-**Errors:**
-
-| Condition | Status |
-|---|---|
-| Unknown `date` value | `400` |
-| Unknown `status` value | `400` |
-| Non-integer `competition`/`organization` | `400` |
-| Nonexistent `competition`/`organization` | `404` |
-
 ---
 
 ## 13. Live Match State
-
-The canonical way for the frontend to display a live match is:
 
 1. `GET /api/public/matches/?status=LIVE` returns all live/halftime matches.
 2. For each match the UI wants updates on, open a WebSocket to
@@ -1206,19 +1326,20 @@ Only `name` is editable.
 
 ---
 
-## 17. Starting Squads
+## 17. Fantasy Squads (Base Squad + Carry-Forward)
 
-A squad is scoped to a **stage** (gameweek). A new gameweek requires a new
-starting squad.
+A fantasy team has **one base squad**, created once. Every gameweek resolves
+to a squad — either the base squad or a gameweek-specific update made by a
+transfer.
 
-**There is no full-squad PUT endpoint.** Replacing a squad wholesale is not
-allowed. To change a squad after the starting squad exists, use transfers
-(§19).
+**There is no full-squad PUT.** To change players after the base squad is
+created, use the transfer endpoint (§18). To temporarily replace the squad
+for one gameweek, use the Free Hit chip (§20).
 
-### Create starting squad
+### Create the base squad
 
 ```
-POST /api/fantasy/teams/<team_id>/starting-squads/<stage_id>/
+POST /api/fantasy/teams/<team_id>/starting-squad/
 Access: Authenticated + must own the team
 ```
 
@@ -1234,41 +1355,42 @@ Access: Authenticated + must own the team
 }
 ```
 
-Fifteen selections total.
+Fifteen selections total. No stage in the URL — the base squad is written
+to the first `GAMEWEEK` of the team's season automatically.
 
-**Response `201`:** Squad response (see §18).
+**Response `201`:** Squad response (see below).
 
 **Errors:**
-- `400` — any of the rules below; or if a starting squad already exists for
-  this `(fantasy_team, stage)`; or if a chip is already active for this stage.
+- `400` — any validation failure below; or a base squad already exists; or
+  the base gameweek is locked.
 - `403` — anonymous.
-- `404` — team or stage unknown, or not the team owner.
+- `404` — team unknown, or not the team owner.
 
-**Rules:**
+**Squad rules:**
 
 - Exactly **15** players.
 - Exactly **2** GK, **5** DEF, **5** MID, **3** ATT.
-- Exactly **11** starters.
-- Exactly **4** bench.
+- Exactly **11** starters, **4** bench.
 - Exactly **1** captain. Captain must be a starter.
 - No duplicate players.
-- Every selected player's team participates in this fantasy team's
-  competition.
+- Every player's team participates in the fantasy team's competition.
 - Total squad cost ≤ `starting_budget`.
 - Every selected player has a fantasy price.
-- Stage must be `kind == GAMEWEEK`, same season, same competition.
-- Stage must not be locked.
 
 **Does not consume a transfer.**
 
-**Can only be called once per `(fantasy_team, stage)`.**
+**Can only be called once per fantasy team.**
 
-### Read squad
+### Read the squad for a gameweek
 
 ```
 GET /api/fantasy/teams/<team_id>/squads/<stage_id>/
 Access: Authenticated + must own the team
 ```
+
+**Carry-forward.** If the gameweek has no explicit rows, the response is
+resolved from the most recent earlier gameweek with rows (or the base squad).
+You can read any gameweek in the season; the response is always a squad.
 
 **Response `200`:**
 
@@ -1277,6 +1399,7 @@ Access: Authenticated + must own the team
   "stage": { "id": 5, "kind": "GAMEWEEK", "kind_display": "Gameweek", "number": 5, "name": "" },
   "locked": false,
   "active_chip": null,
+  "carried_forward": true,
   "starters": [
     {
       "id": 99,
@@ -1294,7 +1417,7 @@ Access: Authenticated + must own the team
       "is_captain": true
     }
   ],
-  "bench": [ /* 4 more */ ],
+  "bench": [ /* 4 more selections */ ],
   "captain_id": 10,
   "squad_value": "98.5",
   "remaining_budget": "1.5",
@@ -1304,17 +1427,22 @@ Access: Authenticated + must own the team
 }
 ```
 
-**Squad state — Free Hit.** When a Free Hit is active for a stage, this
-endpoint returns the temporary Free Hit squad (`active_chip: "FREE_HIT"`).
-Once the gameweek is fully finished, the endpoint returns the permanent
-squad again. Historical scoring for the Free Hit gameweek continues to use
-the Free Hit squad (§21).
+Field notes:
+
+- **`carried_forward`** — `true` when the returned squad comes from an
+  earlier gameweek rather than this one's explicit rows. Use it to show
+  "same as last week" hints.
+- **`locked`** — `true` once any match in the stage has started. Reads
+  still work; writes do not.
+- **`active_chip`** — the chip active for this stage, or `null`.
+- **`transfers_used` / `transfers_remaining`** — count only transfers where
+  `counts_toward_limit=True` (i.e. not Wildcard or Free Hit transfers).
 
 **Errors:** `400` — ROUND stage, wrong season/competition; `404` — team or
 stage missing.
 
-**`PUT /api/fantasy/teams/<team_id>/squads/<stage_id>/` is no longer
-available.** It returns `405`.
+**`PUT /api/fantasy/teams/<team_id>/squads/<stage_id>/` is not available.**
+It returns `405`.
 
 ---
 
@@ -1354,14 +1482,13 @@ Access: Authenticated + must own the team
 
 **Rules:**
 
-- A starting squad must already exist for the stage.
+- A base squad must already exist for the fantasy team.
 - Stage must be `GAMEWEEK`, same season, same competition.
 - Gameweek must not be locked.
 - Outgoing player must be in the current squad for the stage.
 - Incoming player must not already be in the squad.
 - Incoming player must have a fantasy price.
-- Incoming player must be eligible (their team participates in the fantasy
-  team's competition).
+- Incoming player must be eligible.
 - Resulting squad must pass the standard composition and budget checks.
 - Captain cannot be transferred out (change the captain first).
 - Incoming player inherits the outgoing player's starter/bench status.
@@ -1373,10 +1500,16 @@ Access: Authenticated + must own the team
 - A Free Hit active for the stage removes the normal limit for the stage
   (and edits the temporary Free Hit squad, not the permanent squad).
 
-**Accounting.** Every transfer is recorded in `FantasyTransfer`.
-Transfers made while a chip (Wildcard or Free Hit) is active are flagged
-`counts_toward_limit=False` and are excluded from `transfers_used` /
-`transfers_remaining`. The full history is preserved.
+**Accounting.** Every transfer is recorded in a `FantasyTransfer`. Transfers
+made while a Wildcard or Free Hit is active are flagged
+`counts_toward_limit=False` and excluded from `transfers_used` /
+`transfers_remaining`. History is preserved; the counter isn't inflated.
+
+**Carry-forward materialization.** When a transfer is made on a gameweek
+that has no explicit squad rows yet, the backend automatically copies the
+carried-forward squad into that gameweek, then applies the swap. The
+`GET /squads/<stage>/` response reflects the result, and `carried_forward`
+flips to `false`.
 
 **Historical integrity.** Transfers for one stage never modify selections
 for another stage.
@@ -1432,10 +1565,9 @@ Access: Authenticated + must own the team
 
 **Field semantics:**
 
-- `base_points` — the player's raw scoring points for this stage (from
-  match events + lineups).
-- `multiplier` — `1` normally; `2` for the captain; `3` for the captain
-  when `TRIPLE_CAPTAIN` is active for this stage.
+- `base_points` — the player's raw scoring points for this stage.
+- `multiplier` — `1` normally; `2` for the captain; `3` for the captain when
+  `TRIPLE_CAPTAIN` is active for this stage.
 - `points` — `base_points × multiplier`.
 - `starting_xi_points` — sum of `points` for starters only.
 - `bench_points` — sum of `base_points` for bench players (informational).
@@ -1444,7 +1576,7 @@ Access: Authenticated + must own the team
 
 **Historical behavior.** For a stage where a Free Hit was used, the response
 is computed from the Free Hit squad permanently, even after the gameweek
-finishes. This makes historical points deterministic.
+finishes.
 
 **Errors:**
 
@@ -1500,7 +1632,7 @@ Access: Authenticated + must own the team
 { "stage_id": 5, "chip": "WILDCARD" }
 ```
 
-**Request (Free Hit — requires inline temporary squad):**
+**Request (Free Hit):**
 
 ```json
 {
@@ -1513,7 +1645,7 @@ Access: Authenticated + must own the team
 }
 ```
 
-**Response `201`:** The same shape as `GET /api/fantasy/teams/<team_id>/chips/`.
+**Response `201`:** Same shape as the chip state GET.
 
 **Validation:**
 
@@ -1523,10 +1655,8 @@ Access: Authenticated + must own the team
 4. Stage not locked.
 5. Chip has not been used this season by this team.
 6. No other chip already active for this stage.
-7. For Free Hit: an existing permanent starting squad must exist for this
-   stage.
-8. For Free Hit: the provided `selections` must pass the standard squad
-   validation (composition, budget, captain, prices, eligibility).
+7. For Free Hit: an existing base squad must exist.
+8. For Free Hit: `selections` must pass the standard squad validation.
 
 **Errors:** `400` for any rule violation.
 
@@ -1542,15 +1672,14 @@ Access: Authenticated + must own the team
 
 **FREE_HIT**
 
-- Requires an existing permanent starting squad.
+- Requires a base squad.
 - Requires an inline 15-player temporary squad in the activation request.
-- Writes `FantasyPlayerSelection` rows with `is_free_hit=True`.
-- The permanent squad rows are left untouched.
+- Writes selections with `is_free_hit=True`; permanent rows are untouched.
 - `GET /squads/<stage>/` returns the Free Hit squad while the gameweek is
   unfinished; after every match in the stage is `FINISHED`, it reverts to
   the permanent squad.
 - `GET /points/?stage=<id>` always uses the Free Hit squad for that stage,
-  even after the gameweek finishes — historical points are permanent.
+  even after the gameweek finishes.
 - Transfers while Free Hit is active modify the Free Hit squad and are
   unlimited (still respecting composition, budget, captain, eligibility).
 - Transfers made under Free Hit are recorded with `counts_toward_limit=False`.
@@ -1609,6 +1738,13 @@ Access: Authenticated
 
 Rows are sorted by `total_points` descending. Captain multiplier is already
 applied. No email is exposed.
+
+**Scoring scope.**
+
+- **Stage scope (`?stage=<id>`):** each team's effective squad for the stage
+  is resolved via carry-forward. Points come from that stage's matches only.
+- **Season scope (no `stage`):** each team's points are summed across every
+  stage of the season, applying the captain multiplier per stage.
 
 ### Group leaderboard
 
@@ -1801,8 +1937,6 @@ ws://<host>/ws/matches/<match_id>/
 
 ### Message: `match_event`
 
-Sent every time an event is successfully recorded on the match:
-
 ```json
 {
   "type": "match_event",
@@ -1878,8 +2012,7 @@ Athlon uses Django's standard session authentication.
 - `sessionid` — set on successful login/registration.
 - `csrftoken` — set by Django's CSRF middleware.
 
-Both cookies are `HttpOnly=false` for `csrftoken` (readable by JS) and
-`HttpOnly=true` for `sessionid`.
+`csrftoken` is readable by JS; `sessionid` is `HttpOnly`.
 
 ### Requirements for write requests
 
@@ -1921,52 +2054,56 @@ The frontend origin must be in `CORS_ALLOWED_ORIGINS` and
 
 ---
 
-## 27. Development / Demo Seed
+## 27. MVP Limitations
 
-A management command is available for local development and the frontend
-preview:
+Current boundaries of the backend. These are intentional MVP choices, not
+bugs.
 
-```bash
-python manage.py seed_demo             # create demo data (no-op if it exists)
-python manage.py seed_demo --reset     # wipe demo data and recreate it
-```
+### General
 
-**What it creates** (deterministic and repeatable):
+- **No API versioning.** Paths are stable but unversioned.
+- **No pagination.** All list endpoints return the full result set.
+- **No OpenAPI / Swagger schema.**
+- **No rate limiting.**
+- **`401` vs `403`.** Protected endpoints return `403` for anonymous users
+  because the backend uses only `SessionAuthentication`.
 
-- 1 organization: `FUNAAB Sports` (slug `funaab-sports-demo`)
-- 1 competition: `FUNAAB Football League` (type `LEAGUE`)
-- 1 season: `2026 Season`
-- 4 gameweeks (GW1–GW4, all `kind=GAMEWEEK`)
-- 6 teams, 90 players (15 per team: 2 GK / 5 DEF / 5 MID / 3 ATT),
-  each player with a fantasy price
-- 12 matches across the four gameweeks:
-  - GW1: 3 × `FINISHED`
-  - GW2: 3 × `FINISHED`
-  - GW3: 1 × `LIVE`, 1 × `HALFTIME`, 1 × `SCHEDULED`
-  - GW4: 3 × `SCHEDULED` (future kickoffs)
-- Lineups for every played/live match, and events (goals with assists,
-  yellow cards, substitutions, halftime, fulltime)
-- 6 users:
-  - `admin@demo.athlon.local` — role `ADMIN`
-  - `scout@demo.athlon.local` — role `SCOUT`
-  - `user1@demo.athlon.local` through `user5@demo.athlon.local` — role `USER`
-- 5 `TeamManager` rows (user1–user5 as managers of teams 1–5)
-- 5 `FantasyTeam` rows with valid squads across all four gameweeks
-- Chip uses demonstrating all four chips:
-  - user4: `BENCH_BOOST` (GW1, finished)
-  - user5: `TRIPLE_CAPTAIN` (GW1, finished)
-  - user3: `FREE_HIT` (GW3, current — both permanent and FH squads exist)
-  - user2: `WILDCARD` (GW4, upcoming)
-- One normal transfer and one Wildcard transfer (accounting is correct)
-- `FantasyPoints` generated via the real match-event pipeline
+### League
 
-**Demo credentials.** All demo users share the development password
-`DemoPassword!2026`. These are **development-only credentials**. Never use
-them anywhere except a local/dev instance.
+- No update endpoints for organizations, competitions, seasons, stages,
+  teams, or players.
+- No organization-scoped admin. The global `ADMIN` role is the stand-in for
+  competition administration.
+- No historical player transfers.
+- Standings are computed on demand; they are not cached.
 
-**Reset behavior.** `--reset` deletes only data created by this command,
-identified by the organization slug `funaab-sports-demo` and the email
-domain `demo.athlon.local`. It does not touch arbitrary development data.
+### Matches
+
+- No match update endpoint.
+- No lineup versioning or history.
+- No lineup override after kickoff.
+- No dedicated `/api/matches/live/` endpoint. Use `?status=LIVE`.
+- No client-to-server WebSocket messages.
+
+### Public API
+
+- No dedicated "today by competition" endpoint. Group
+  `/api/public/matches/?date=today` client-side.
+- No pagination.
+
+### Fantasy
+
+- No transfers rollover, -4 penalties, or paid transfers. Each gameweek has
+  a fixed transfer allowance.
+- No formations. Squad composition is fixed: 2 GK / 5 DEF / 5 MID / 3 ATT.
+- No automatic substitutions.
+- No standalone fantasy-points write endpoint.
+- The leaderboard's season scope resolves carry-forward per team per stage.
+  For very large seasons this may be slow; caching is out of scope.
+- No fantasy WebSocket. Match updates come over the match WebSocket (§24).
+- No group ownership transfer.
+- Groups are not scoped to a competition/season.
+- No invite-code rotation.
 
 ---
 
