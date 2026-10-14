@@ -143,6 +143,7 @@ class StageSerializer(serializers.ModelSerializer):
             "kind",
             "number",
             "name",
+            "is_group",
             "start_date",
             "end_date",
             "created_at",
@@ -155,6 +156,7 @@ class StageCreateSerializer(serializers.Serializer):
     kind = serializers.ChoiceField(choices=Stage.Kind.choices)
     number = serializers.IntegerField(min_value=1)
     name = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    is_group = serializers.BooleanField(required=False, default=False)
     start_date = serializers.DateField(required=False, allow_null=True)
     end_date = serializers.DateField(required=False, allow_null=True)
     
@@ -288,3 +290,26 @@ class TeamManagerWriteSerializer(serializers.Serializer):
         queryset=User.objects.all(),
         source="user",
     )
+
+# ---------------------------------------------------------------------------
+# Standings
+# ---------------------------------------------------------------------------
+class StandingsRowSerializer(serializers.Serializer):
+    rank = serializers.IntegerField()
+    team = TeamBriefSerializer()
+    played = serializers.IntegerField()
+    won = serializers.IntegerField()
+    drawn = serializers.IntegerField()
+    lost = serializers.IntegerField()
+    goals_for = serializers.IntegerField()
+    goals_against = serializers.IntegerField()
+    goal_difference = serializers.IntegerField()
+    points = serializers.IntegerField()
+
+
+class StandingsSerializer(serializers.Serializer):
+    competition = CompetitionBriefSerializer()
+    season = SeasonBriefSerializer(allow_null=True)
+    stage = StageSerializer(allow_null=True)
+    scope = serializers.CharField()
+    rows = StandingsRowSerializer(many=True)

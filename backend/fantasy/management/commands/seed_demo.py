@@ -152,6 +152,85 @@ class Command(BaseCommand):
         Organization.objects.filter(slug=self.DEMO_ORG_SLUG).delete()
         self.stdout.write(self.style.WARNING("Demo data cleared."))
 
+    def _create_demo_cup(self, *, org, teams, players_by_team_id):
+        """
+        A fictional cup with:
+          - one group stage (kind=ROUND, is_group=True) with matches
+          - one knockout round (kind=ROUND, is_group=False) with matches
+        So the frontend can demo both the table and the "hide table for
+        knockout" behavior.
+        """
+        cup = create_competition(
+            organization=org,
+            name="FUNAAB Cup",
+            description="Demo knockout cup.",
+            type=Competition.Type.CUP,
+            slug="funaab-cup-demo",
+        )
+        cup_season = create_season(
+            competition=cup,
+            name="2026 Cup",
+            slug="2026-cup",
+        )
+        group_stage = create_stage(
+            season=cup_season, kind=Stage.Kind.ROUND, number=1,
+            name="Group Stage", is_group=True,
+        )
+        quarter_stage = create_stage(
+            season=cup_season, kind=Stage.Kind.ROUND, number=2,
+            name="Quarter-final", is_group=False,
+        )
+
+        for t in teams:
+            add_team_to_competition(competition=cup, team=t)
+
+        # Group stage: three matches, all finished, on the same day.
+        from django.utils import timezone
+        kickoff = timezone.now() - timedelta(days=10)
+        group_pairings = [
+            (teams[0], teams[1]),
+            (teams[2], teams[3]),
+            (teams[4], teams[5]),
+        ]
+        for home, away in group_pairings:
+            m = create_match(
+                competition=cup, home_team=home, away_team=away,
+                stage=group_stage, kickoff_at=kickoff,
+            )
+            Match.objects.filter(pk=m.pk).update(status=Match.Status.FINISHED)
+            m.refresh_from_db()
+            # Simple results: home team wins 1-0.
+            record_match_event(
+                match=m, event_type=MatchEvent.Type.GOAL, minute=30,
+                team=home, player=list(players_by_team_id[home.id])[12],
+            )
+            record_match_event(
+                match=m, event_type=MatchEvent.Type.FULLTIME, minute=90,
+            )
+
+        # Quarter-final: two matches, one finished, one upcoming.
+        qf_kickoff_done = timezone.now() - timedelta(days=5)
+        qf_kickoff_upcoming = timezone.now() + timedelta(days=3)
+        qf_pairings = [
+            (teams[0], teams[2], qf_kickoff_done, True),
+            (teams[4], teams[1], qf_kickoff_upcoming, False),
+        ]
+        for home, away, ko, finished in qf_pairings:
+            m = create_match(
+                competition=cup, home_team=home, away_team=away,
+                stage=quarter_stage, kickoff_at=ko,
+            )
+            if finished:
+                Match.objects.filter(pk=m.pk).update(status=Match.Status.FINISHED)
+                m.refresh_from_db()
+                record_match_event(
+                    match=m, event_type=MatchEvent.Type.GOAL, minute=55,
+                    team=home, player=list(players_by_team_id[home.id])[13],
+                )
+                record_match_event(
+                    match=m, event_type=MatchEvent.Type.FULLTIME, minute=90,
+                )
+
     # ------------------------------------------------------------------
     # Seed
     # ------------------------------------------------------------------
@@ -180,7 +259,11 @@ class Command(BaseCommand):
         gw2 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=2, name="Gameweek 2")
         gw3 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=3, name="Gameweek 3")
         gw4 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=4, name="Gameweek 4")
+        gw5 = create_stage(season=season, kind=Stage.Kind.GAMEWEEK, number=5, name="Gameweek 5")
 
+        # -- 13. Cup with a group stage + knockout -----------------------
+        self._create_demo_cup(org=org, teams=teams, players_by_team_id=players_by_team_id)
+        
         # -- 3. Teams + participation ------------------------------------
         teams = []
         for name, short in TEAM_SPECS:
@@ -281,6 +364,17 @@ class Command(BaseCommand):
             replacement_players=list(players_by_team_id[teams[2].id]),
         )
 
+        # -- 12. GW5: fixtures spread across the next 7 days -------------
+        #     Lineups pre-submitted so the frontend has realistic data to
+        #     render and managers have something to edit.
+        self._create_week_fixtures(
+            competition=competition,
+            season=season,
+            stage=gw5,
+            teams=teams,
+            players_by_team_id=players_by_team_id,
+        )
+
     # ==================================================================
     # Internals
     # ==================================================================
@@ -345,13 +439,13 @@ class Command(BaseCommand):
             for i, p in enumerate(players)
         ]
 
-    def _create_squads_for_all(self, fantasy_teams, stage, players_by_team_id):
+    def _create_squads_for_all(self, fantasy_teams, players_by_team_id):
         # Order of fantasy_teams matches order of teams they were built from.
         team_list = list(players_by_team_id.keys())
         for i, ft in enumerate(fantasy_teams):
             players = list(players_by_team_id[team_list[i]])
             selections = self._build_squad_payload(players)
-            create_starting_squad(fantasy_team=ft, stage=stage, selections=selections)
+            create_starting_squad(fantasy_team=ft, selections=selections)
 
     # ------------------------------------------------------------------
     # Playing out a stage
@@ -474,6 +568,67 @@ class Command(BaseCommand):
         )
 
         # Match 2 stays SCHEDULED (lineup already submitted, no events)
+
+    # ------------------------------------------------------------------
+    # Next-7-days fixtures
+    # ------------------------------------------------------------------
+    def _create_week_fixtures(self, *, competition, season, stage, teams,
+                              players_by_team_id):
+        """
+        Create fixtures spread across the next 7 calendar days.
+
+        - kickoff times are day-relative so the frontend always has
+          upcoming matches relative to `now`
+        - lineups are pre-submitted so the lineup UI has data to render
+        - no events are recorded: every match stays SCHEDULED
+        """
+        now = timezone.now()
+
+        # Round-robin-ish pairings across the next week.
+        # 6 teams -> 15 possible pairings; we use 6 spread across 7 days.
+        # Order chosen so no team plays twice on the same day.
+        fixtures = [
+            # (home_idx, away_idx, days_from_now, hour)
+            (0, 1, 1, 15),   # tomorrow 15:00
+            (2, 3, 1, 18),   # tomorrow 18:00
+            (4, 5, 2, 16),   # +2 days 16:00
+            (0, 2, 3, 15),   # +3 days 15:00
+            (3, 5, 4, 18),   # +4 days 18:00
+            (1, 4, 6, 20),   # +6 days 20:00
+        ]
+
+        created = []
+        for home_idx, away_idx, days_ahead, hour in fixtures:
+            home = teams[home_idx]
+            away = teams[away_idx]
+            kickoff = (now + timedelta(days=days_ahead)).replace(
+                hour=hour, minute=0, second=0, microsecond=0
+            )
+            m = create_match(
+                competition=competition,
+                home_team=home,
+                away_team=away,
+                stage=stage,
+                kickoff_at=kickoff,
+            )
+            created.append(m)
+
+        # Pre-submit lineups so managers can edit / view them from the API.
+        for m in created:
+            home_players = list(players_by_team_id[m.home_team_id])
+            away_players = list(players_by_team_id[m.away_team_id])
+            submit_lineup(
+                match=m, team=m.home_team,
+                starters=[home_players[i] for i in STARTER_INDICES],
+                bench=[home_players[i] for i in BENCH_INDICES],
+            )
+            submit_lineup(
+                match=m, team=m.away_team,
+                starters=[away_players[i] for i in STARTER_INDICES],
+                bench=[away_players[i] for i in BENCH_INDICES],
+            )
+
+        return created
 
     # ------------------------------------------------------------------
     # Demo transfer

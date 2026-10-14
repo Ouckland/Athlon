@@ -1,7 +1,7 @@
 from django.db import transaction
 
 from matches.models import Match
-
+from league.models import Stage
 from fantasy.models import FantasyChipUse, FantasyPlayerSelection
 from fantasy.services.teams import (
     FantasyError,
@@ -71,36 +71,27 @@ def _stage_finished(stage):
         return False
     return not relevant.exclude(status=Match.Status.FINISHED).exists()
 
-
 def get_current_selections(*, fantasy_team, stage):
-    """
-    The squad currently in force for the stage.
-
-    - Free Hit used AND stage not yet finished → Free Hit rows
-    - Otherwise                                → permanent rows
-    """
     fh_used = _free_hit_used_for_stage(fantasy_team=fantasy_team, stage=stage)
     if fh_used and not _stage_finished(stage):
         return FantasyPlayerSelection.objects.filter(
             fantasy_team=fantasy_team, stage=stage, is_free_hit=True
         )
-    return FantasyPlayerSelection.objects.filter(
+    # For the current (editable) stage, return the effective permanent squad.
+    return _resolve_carried_forward_qs(
         fantasy_team=fantasy_team, stage=stage, is_free_hit=False
     )
 
-
 def get_scoring_selections(*, fantasy_team, stage):
-    """
-    The squad that generated the fantasy points for the stage.
-
-    Once Free Hit has been used for a stage, that stage's scoring is always
-    based on the Free Hit squad — even after the gameweek finishes. This
-    makes historical scoring deterministic and immune to whatever squad
-    the user currently has.
-    """
     fh_used = _free_hit_used_for_stage(fantasy_team=fantasy_team, stage=stage)
-    return FantasyPlayerSelection.objects.filter(
-        fantasy_team=fantasy_team, stage=stage, is_free_hit=fh_used
+    # FH scoring is scoped to the exact stage — a Free Hit is not carried.
+    if fh_used:
+        return FantasyPlayerSelection.objects.filter(
+            fantasy_team=fantasy_team, stage=stage, is_free_hit=True
+        )
+    # For a permanent squad, use the effective squad as of that stage.
+    return _resolve_carried_forward_qs(
+        fantasy_team=fantasy_team, stage=stage, is_free_hit=False
     )
 
 
@@ -155,10 +146,10 @@ def activate_chip(*, fantasy_team, stage, chip_type, selections=None):
 
     if chip_type == FantasyChipUse.Chip.FREE_HIT:
         if not FantasyPlayerSelection.objects.filter(
-            fantasy_team=fantasy_team, stage=stage, is_free_hit=False
+            fantasy_team=fantasy_team, is_free_hit=False
         ).exists():
             raise FantasyError(
-                "Free Hit requires an existing starting squad for this gameweek."
+                "Free Hit requires an existing starting squad."
             )
         if not selections:
             raise FantasyError(
@@ -191,3 +182,41 @@ def activate_chip(*, fantasy_team, stage, chip_type, selections=None):
             chip_type=chip_type,
         )
     return use
+
+def _resolve_carried_forward_qs(*, fantasy_team, stage, is_free_hit):
+    """
+    Return selections in force for `stage`:
+      1. Exact rows for (fantasy_team, stage, is_free_hit) if any exist.
+      2. Else, walk back through earlier GAMEWEEK stages of the same season
+         and return the most recent rows for (fantasy_team, *, is_free_hit).
+      3. Else, empty queryset.
+
+    Does NOT copy rows; just resolves.
+    """
+    exact = FantasyPlayerSelection.objects.filter(
+        fantasy_team=fantasy_team, stage=stage, is_free_hit=is_free_hit
+    )
+    if exact.exists():
+        return exact
+
+    # Find the most recent earlier stage in this season that has rows for
+    # this fantasy team.
+    earlier_stage_ids = (
+        Stage.objects
+        .filter(
+            season=fantasy_team.season,
+            kind=Stage.Kind.GAMEWEEK,
+            number__lt=stage.number,
+        )
+        .order_by("-number")
+        .values_list("id", flat=True)
+    )
+    for earlier_id in earlier_stage_ids:
+        qs = FantasyPlayerSelection.objects.filter(
+            fantasy_team=fantasy_team,
+            stage_id=earlier_id,
+            is_free_hit=is_free_hit,
+        )
+        if qs.exists():
+            return qs
+    return FantasyPlayerSelection.objects.none()

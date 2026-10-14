@@ -3,7 +3,7 @@ from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
-
+from matches.models import Match
 from .models import Competition, Organization, Player, Team, Season, Stage, TeamManager
 from .services import LeagueError, set_team_captain, set_team_competitions, TeamManagerError,add_team_manager,can_manage_team,is_team_manager,remove_team_manager
 User = get_user_model()
@@ -1127,3 +1127,269 @@ class CompetitionTypeCreationTests(TestCase):
             format="json",
         )
         self.assertEqual(resp.status_code, 201)
+
+
+class StandingsTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org", slug="org-std")
+        self.league = Competition.objects.create(
+            organization=self.org, name="League", slug="league-std",
+            type=Competition.Type.LEAGUE,
+        )
+        self.season = Season.objects.create(
+            competition=self.league, name="2026", slug="2026-std",
+            status=Season.Status.ACTIVE,
+        )
+        self.gw1 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=1,
+            name="Gameweek 1",
+        )
+        self.gw2 = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.GAMEWEEK, number=2,
+            name="Gameweek 2",
+        )
+
+        self.a = Team.objects.create(organization=self.org, name="Alpha", slug="alpha-std")
+        self.b = Team.objects.create(organization=self.org, name="Bravo", slug="bravo-std")
+        self.c = Team.objects.create(organization=self.org, name="Charlie", slug="charlie-std")
+        for t in (self.a, self.b, self.c):
+            self.league.teams.add(t)
+
+    def _match(self, *, stage, home, away, hs, as_, status=Match.Status.FINISHED):
+        return Match.objects.create(
+            competition=self.league,
+            home_team=home, away_team=away,
+            stage=stage,
+            home_score=hs, away_score=as_,
+            status=status,
+        )
+
+    # -- service tests ----------------------------------------------------
+    def test_season_scope_full_table(self):
+        from league.services import competition_standings
+        # A beats B 2-1
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=2, as_=1)
+        # C draws A 0-0
+        self._match(stage=self.gw1, home=self.c, away=self.a, hs=0, as_=0)
+        # B beats C 3-0
+        self._match(stage=self.gw2, home=self.b, away=self.c, hs=3, as_=0)
+
+        data = competition_standings(competition=self.league)
+        rows = data["rows"]
+        self.assertEqual(len(rows), 3)
+        # Alpha: 1 win 1 draw = 4 pts, GD +1
+        # Bravo: 1 win 1 loss = 3 pts, GD +1
+        # Charlie: 1 draw 1 loss = 1 pt, GD -2
+        self.assertEqual([r["team"].name for r in rows], ["Alpha", "Bravo", "Charlie"])
+        self.assertEqual(rows[0]["points"], 4)
+        self.assertEqual(rows[1]["points"], 3)
+        self.assertEqual(rows[2]["points"], 1)
+
+    def test_zero_played_teams_appear_in_season_scope(self):
+        from league.services import competition_standings
+        # No matches played.
+        data = competition_standings(competition=self.league)
+        rows = data["rows"]
+        self.assertEqual(len(rows), 3)
+        for r in rows:
+            self.assertEqual(r["played"], 0)
+            self.assertEqual(r["points"], 0)
+
+    def test_stage_scope_only_includes_stage_matches(self):
+        from league.services import competition_standings
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=2, as_=1)
+        self._match(stage=self.gw2, home=self.b, away=self.c, hs=3, as_=0)
+
+        gw1_data = competition_standings(
+            competition=self.league, season=self.season, stage=self.gw1,
+        )
+        self.assertEqual(gw1_data["scope"], "stage")
+        # Only A and B played in GW1.
+        self.assertEqual(len(gw1_data["rows"]), 2)
+        names = {r["team"].name for r in gw1_data["rows"]}
+        self.assertEqual(names, {"Alpha", "Bravo"})
+
+    def test_ordering_points_gd_gf_name(self):
+        from league.services import competition_standings
+        # A 3 pts (GD +1)
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=2, as_=1)
+        # B 3 pts (GD +2) — should outrank A
+        self._match(stage=self.gw1, home=self.b, away=self.c, hs=3, as_=1)
+        data = competition_standings(competition=self.league)
+        # Bravo has 3 pts GD +2, Alpha has 3 pts GD +1, Charlie 0 pts
+        self.assertEqual(data["rows"][0]["team"].name, "Bravo")
+        self.assertEqual(data["rows"][1]["team"].name, "Alpha")
+
+    def test_non_finished_matches_ignored(self):
+        from league.services import competition_standings
+        self._match(
+            stage=self.gw1, home=self.a, away=self.b, hs=5, as_=0,
+            status=Match.Status.LIVE,
+        )
+        data = competition_standings(competition=self.league)
+        for r in data["rows"]:
+            self.assertEqual(r["played"], 0)
+
+    def test_draw_awards_one_point_each(self):
+        from league.services import competition_standings
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=1, as_=1)
+        data = competition_standings(competition=self.league)
+        for r in data["rows"]:
+            if r["team"].name in ("Alpha", "Bravo"):
+                self.assertEqual(r["points"], 1)
+                self.assertEqual(r["drawn"], 1)
+
+    def test_default_season_is_active(self):
+        from league.services import competition_standings
+        # Create a second, completed season — active one should still win.
+        s2 = Season.objects.create(
+            competition=self.league, name="2025", slug="2025-std",
+            status=Season.Status.COMPLETED,
+        )
+        data = competition_standings(competition=self.league)
+        self.assertEqual(data["season"].id, self.season.id)
+
+    # -- API tests --------------------------------------------------------
+    def test_api_season_scope(self):
+        client = APIClient()
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=2, as_=1)
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["scope"], "season")
+        self.assertIsNone(r.data["stage"])
+        self.assertEqual(len(r.data["rows"]), 3)
+        row = r.data["rows"][0]
+        for key in ("rank", "team", "played", "won", "drawn", "lost",
+                    "goals_for", "goals_against", "goal_difference", "points"):
+            self.assertIn(key, row)
+
+    def test_api_stage_scope(self):
+        client = APIClient()
+        self._match(stage=self.gw1, home=self.a, away=self.b, hs=2, as_=1)
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url, {"stage": self.gw1.id})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["scope"], "stage")
+        self.assertEqual(r.data["stage"]["id"], self.gw1.id)
+
+    def test_api_public(self):
+        client = APIClient()
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url)
+        self.assertEqual(r.status_code, 200)
+
+    def test_api_non_integer_season(self):
+        client = APIClient()
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url, {"season": "abc"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_api_unknown_season_404(self):
+        client = APIClient()
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url, {"season": 999999})
+        self.assertEqual(r.status_code, 404)
+
+    def test_api_stage_from_other_competition_rejected(self):
+        client = APIClient()
+        other = Competition.objects.create(
+            organization=self.org, name="Other", slug="other-std",
+        )
+        other_season = Season.objects.create(
+            competition=other, name="2026", slug="2026-other-std",
+        )
+        other_stage = Stage.objects.create(
+            season=other_season, kind=Stage.Kind.GAMEWEEK, number=1,
+        )
+        url = reverse("league:competition-standings", args=[self.league.id])
+        r = client.get(url, {"stage": other_stage.id})
+        self.assertEqual(r.status_code, 404)
+
+
+class CupGroupStandingsTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org", slug="org-cup-std")
+        self.cup = Competition.objects.create(
+            organization=self.org, name="Cup", slug="cup-std",
+            type=Competition.Type.CUP,
+        )
+        self.season = Season.objects.create(
+            competition=self.cup, name="2026", slug="2026-cup-std",
+            status=Season.Status.ACTIVE,
+        )
+        self.group_a = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.ROUND, number=1,
+            name="Group A", is_group=True,
+        )
+        self.group_b = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.ROUND, number=2,
+            name="Group B", is_group=True,
+        )
+        self.knockout = Stage.objects.create(
+            season=self.season, kind=Stage.Kind.ROUND, number=3,
+            name="Semi-final", is_group=False,
+        )
+
+        self.teams = [
+            Team.objects.create(organization=self.org, name=f"T{i}", slug=f"t{i}-cup-std")
+            for i in range(1, 5)
+        ]
+        for t in self.teams:
+            self.cup.teams.add(t)
+
+    def _match(self, *, stage, home, away, hs, as_):
+        return Match.objects.create(
+            competition=self.cup,
+            home_team=home, away_team=away,
+            stage=stage, home_score=hs, away_score=as_,
+            status=Match.Status.FINISHED,
+        )
+
+    def test_group_stage_standings_are_isolated(self):
+        from league.services import competition_standings
+        # Group A: T1 beats T2
+        self._match(stage=self.group_a, home=self.teams[0], away=self.teams[1], hs=2, as_=0)
+        # Group B: T3 beats T4
+        self._match(stage=self.group_b, home=self.teams[2], away=self.teams[3], hs=1, as_=0)
+
+        ga = competition_standings(
+            competition=self.cup, season=self.season, stage=self.group_a,
+        )
+        names_a = {r["team"].name for r in ga["rows"]}
+        self.assertEqual(names_a, {"T1", "T2"})
+
+        gb = competition_standings(
+            competition=self.cup, season=self.season, stage=self.group_b,
+        )
+        names_b = {r["team"].name for r in gb["rows"]}
+        self.assertEqual(names_b, {"T3", "T4"})
+
+    def test_knockout_stage_returns_rows_but_frontend_decides(self):
+        from league.services import competition_standings
+        self._match(stage=self.knockout, home=self.teams[0], away=self.teams[2], hs=1, as_=0)
+        data = competition_standings(
+            competition=self.cup, season=self.season, stage=self.knockout,
+        )
+        # Backend still returns numbers — the frontend hides the table
+        # when stage.is_group is False.
+        self.assertEqual(len(data["rows"]), 2)
+        # The is_group flag is exposed on the stage object in the API
+        # response (see test_api_stage_scope_exposes_is_group below).
+
+    def test_api_stage_scope_exposes_is_group(self):
+        client = APIClient()
+        self._match(stage=self.group_a, home=self.teams[0], away=self.teams[1], hs=2, as_=0)
+        url = reverse("league:competition-standings", args=[self.cup.id])
+        r = client.get(url, {"stage": self.group_a.id})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.data["stage"]["is_group"])
+        self.assertEqual(r.data["stage"]["name"], "Group A")
+
+    def test_api_knockout_stage_flag_is_false(self):
+        client = APIClient()
+        self._match(stage=self.knockout, home=self.teams[0], away=self.teams[2], hs=1, as_=0)
+        url = reverse("league:competition-standings", args=[self.cup.id])
+        r = client.get(url, {"stage": self.knockout.id})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.data["stage"]["is_group"])

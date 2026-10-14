@@ -7,7 +7,11 @@ from fantasy.models import (
     FantasyTeam,
     FantasyTransfer,
 )
-from fantasy.services.chips import get_active_chip, get_current_selections
+from fantasy.services.chips import (
+    _resolve_carried_forward_qs,
+    get_active_chip,
+    get_current_selections,
+)
 from fantasy.services.teams import (
     FantasyError,
     _validate_squad,
@@ -31,6 +35,47 @@ def transfers_remaining(*, fantasy_team, stage):
     ))
 
 
+def _ensure_stage_materialized(*, fantasy_team, stage):
+    """
+    If the target stage has no permanent rows for this fantasy team, copy
+    the carried-forward squad into it.
+
+    This converts a "virtual" carried-forward squad (resolved from an
+    earlier stage at read time) into concrete rows for the target stage,
+    so subsequent mutations can edit them in place.
+
+    Idempotent: does nothing if the stage already has rows.
+
+    Must be called inside an open transaction.
+    """
+    if FantasyPlayerSelection.objects.filter(
+        fantasy_team=fantasy_team, stage=stage, is_free_hit=False
+    ).exists():
+        return
+
+    source = list(
+        _resolve_carried_forward_qs(
+            fantasy_team=fantasy_team, stage=stage, is_free_hit=False
+        )
+    )
+    if not source:
+        return
+
+    FantasyPlayerSelection.objects.bulk_create(
+        [
+            FantasyPlayerSelection(
+                fantasy_team=fantasy_team,
+                stage=stage,
+                player_id=sel.player_id,
+                is_starter=sel.is_starter,
+                is_captain=sel.is_captain,
+                is_free_hit=False,
+            )
+            for sel in source
+        ]
+    )
+
+
 def make_transfer(*, fantasy_team, stage, player_out, player_in):
     validate_stage_for_fantasy(fantasy_team=fantasy_team, stage=stage)
     if is_gameweek_locked(stage):
@@ -49,6 +94,12 @@ def make_transfer(*, fantasy_team, stage, player_out, player_in):
     with transaction.atomic():
         if connection.features.has_select_for_update:
             FantasyTeam.objects.select_for_update().get(pk=fantasy_team.pk)
+
+        # Convert the carried-forward squad into concrete rows for this
+        # stage before reading the current squad. Without this, the
+        # transfer would delete a row from the fallback stage and create
+        # a lone incoming row in the target stage.
+        _ensure_stage_materialized(fantasy_team=fantasy_team, stage=stage)
 
         current = list(
             get_current_selections(fantasy_team=fantasy_team, stage=stage)

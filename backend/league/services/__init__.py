@@ -5,6 +5,9 @@ from .team_managers import (
     is_team_manager,
     remove_team_manager,
 )
+from .standings import (
+    competition_standings,  
+)
 
 from .league import (
     LeagueError,

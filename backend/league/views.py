@@ -6,6 +6,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
 
 from accounts.models import User
+from league.services.standings import competition_standings
 from .models import Competition, Organization, Player, Season, Stage, Team
 from .serializers import (
     CompetitionSerializer,
@@ -15,6 +16,7 @@ from .serializers import (
     SeasonSerializer,
     StageCreateSerializer,
     StageSerializer,
+    StandingsSerializer,
     TeamSerializer,
     TeamBriefSerializer,
     CompetitionTeamWriteSerializer,
@@ -354,3 +356,46 @@ def team_manager_detail_view(request, team_id, user_id):
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+# ---------------------------------------------------------------------------
+# Standings
+# ---------------------------------------------------------------------------
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def competition_standings_view(request, competition_id):
+    competition = get_object_or_404(Competition, pk=competition_id)
+
+    season_id = request.query_params.get("season")
+    season = None
+    if season_id:
+        try:
+            season_id_int = int(season_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "season must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        season = get_object_or_404(
+            Season.objects.filter(competition=competition),
+            pk=season_id_int,
+        )
+
+    stage_id = request.query_params.get("stage")
+    stage = None
+    if stage_id:
+        try:
+            stage_id_int = int(stage_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "stage must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        stage = get_object_or_404(
+            Stage.objects.filter(season__competition=competition),
+            pk=stage_id_int,
+        )
+
+    data = competition_standings(
+        competition=competition, season=season, stage=stage,
+    )
+    return Response(StandingsSerializer(data).data)

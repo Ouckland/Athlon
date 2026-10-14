@@ -173,16 +173,6 @@ class Season(models.Model):
 
 
 class Stage(models.Model):
-    """
-    A scheduling unit inside a Season.
-
-    - LEAGUE competitions use kind=GAMEWEEK (Matchday 1, 2, 3, ...)
-    - CUP competitions use kind=ROUND    (Quarter-final, Semi-final, Final, ...)
-
-    Match and the fantasy engine treat stages identically; only the frontend
-    and the service layer care about the kind.
-    """
-
     class Kind(models.TextChoices):
         GAMEWEEK = "GAMEWEEK", "Gameweek"
         ROUND = "ROUND", "Round"
@@ -193,6 +183,10 @@ class Stage(models.Model):
     kind = models.CharField(max_length=16, choices=Kind.choices)
     number = models.PositiveSmallIntegerField()
     name = models.CharField(max_length=100, blank=True)
+    # Only meaningful when kind == ROUND. Marks a group-stage round whose
+    # results should be aggregated into a table. Knockout rounds leave
+    # this False.
+    is_group = models.BooleanField(default=False)
     start_date = models.DateField(null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -209,6 +203,7 @@ class Stage(models.Model):
     def __str__(self):
         label = self.name or f"{self.get_kind_display()} {self.number}"
         return f"{self.season} · {label}"
+    
 
 class TeamManager(models.Model):
     """
